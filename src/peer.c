@@ -803,18 +803,14 @@ void handle_inform_message(RequestHeader_t* inform_header, char* inform_body) {
         uint32_t port_network_order;
         memcpy(&port_network_order, &inform_body[16], 4);
         new_peer->port = ntohl(port_network_order);
-        /* new_peer->port = ntohl(inform_body[16]); */
-        // TODO - I don't know if this signature should be salted and hashed again?
-        /* hashdata_t* new_peer_network_sig = (hashdata_t*) malloc(sizeof(hashdata_t)); */
-        /* char random_salt[SALT_LEN]; */
-        /* generate_random_salt(random_salt); */
-        /* get_signature(inform_body, 32, random_salt, new_peer_network_sig); */
+
         memcpy(new_peer->signature, &inform_body[20], 32);
         memcpy(new_peer->salt, &inform_body[52], 16);
         network[peer_count] = new_peer;
         peer_count++;
 
         printf("Updating network on inform. Number of peers %d\n", peer_count);
+        printf("%s:%d with salt %s\n", new_peer->ip, new_peer->port, new_peer->salt);
         for (int n = 0; n<peer_count; n++) {
             print_network_address(network[n]);
         }
@@ -1013,20 +1009,17 @@ void* handle_server_request(void* arg) {
     // TODO - remove when simplifying
     //free(request_header_buffer);
 
+    if (!is_valid_ip(request_ip) || !is_valid_port(request_port)) {
+        printf("Request was not with a valid IP or port.\n");
+        send_error_message("", 7, request_connfd);
+        return NULL;
+    }
     // Read request body - if there is any
     char request_body[request_body_length];
     compsys_helper_readnb(&state, &request_body, request_body_length);
     printf("Handling server request with command: %d\n", request_command);
 
-    // Check if hashes match
-    // only if this is someone already registered.
 
-    //hashdata_t request_signature_hash;
-    //get_data_sha(request_body, request_signature_hash, request_body_length, SHA256_HASH_SIZE);
-    //if (memcmp(request_signature_hash, request_signature, SHA256_HASH_SIZE)) {
-    //    printf("Hashes of request message body didn't match. Resend request.\n");
-    //    send_error_message("Wrong signature", 4, request_connfd);
-    //}
 
     NetworkAddress_t requesting_peer;
     memcpy(&requesting_peer.ip, request_ip, 16);
@@ -1067,7 +1060,10 @@ void* handle_server_request(void* arg) {
         send_error_message("Not registered in network.\0", 3, request_connfd);
         printf("Peer requesting was not registered in network.\n");
         return NULL;
-    } 
+    }
+
+        // Check if hashes match
+    // only if this is someone already registered.
 
     hashdata_t incoming_signature_hash;// = (hashdata_t*)malloc(sizeof(hashdata_t));
     NetworkAddress_t* requesting_peer_info = malloc(sizeof(NetworkAddress_t));
@@ -1189,6 +1185,7 @@ int main(int argc, char **argv)
     printf("Init - Salt: ");
     for (int i = 0; i < 16; i++) printf("%02x", (unsigned char)salt[i]);
     printf("\n");
+    printf("Salt as string %s\n", salt);
 
     //generate_random_salt(salt);
     memcpy(my_address->salt, salt, SALT_LEN);
