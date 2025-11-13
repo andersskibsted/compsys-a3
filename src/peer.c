@@ -41,10 +41,17 @@ typedef struct request_thread_args {
 
 void get_signature(void *password, int password_len, char *salt,
                    hashdata_t* hash) {
-  size_t length = strlen(salt) + password_len;
+    printf("beginnig of sig func\n");
+  size_t length = SALT_LEN + password_len;
   char password_with_salt[length];
-  strcpy(password_with_salt, password);
-  strcat(password_with_salt, salt);
+  printf("going to copy password\n");
+  memcpy(password_with_salt, password, password_len);
+  //strcpy(password_with_salt, password);
+  printf("going to concatenate\n");
+  memcpy(&password_with_salt[password_len], salt, SALT_LEN);
+  //strcat(password_with_salt, salt);
+
+  printf("going to make actual hash\n");
   get_data_sha(password_with_salt, hash, length, SHA256_HASH_SIZE);
 }
 // Function to shuffle numbers in array
@@ -88,6 +95,7 @@ void print_network_address(NetworkAddress_t* address) {
 
 // TODO - Should it do something to data in place, so it is more obvious who
 // allocates the memory? Just remember to free network[] when done this way
+//
 NetworkAddress_t* make_network_addres_from_response(void *data, int offset) {
   // Parse data read in from response to a register request.
   // offset is because it is used in a loop, so it reads from entire message
@@ -115,7 +123,6 @@ int is_in_network(NetworkAddress_t **network, NetworkAddress_t* peer, int number
     }
   }
   return 0;
-  
 }
 
 int is_same_peer(NetworkAddress_t* peer1, NetworkAddress_t* peer2) {
@@ -126,6 +133,35 @@ int is_same_peer(NetworkAddress_t* peer1, NetworkAddress_t* peer2) {
     } else {
         return 0;
     }
+}
+
+int find_in_network(NetworkAddress_t* peer_to_match, NetworkAddress_t* new_peer_location) {
+    // Looks up and finds peer in network returning network address
+    // with signature and salt.
+    // returns 1 if found, 0 if not.
+    if (is_in_network(network, peer_to_match, peer_count)) {
+        for (int i = 0; i<peer_count; i++) {
+            if (is_same_peer(peer_to_match, network[i])) {
+                memcpy(new_peer_location, network[i], sizeof(NetworkAddress_t));
+                return 1;
+            }
+        }
+    }
+    // return 0 if non found.
+    return 0;
+}
+
+
+int is_same_ip_and_port(char* ip1, int port1, char* ip2, int port2) {
+    // Checks if the two inputs have matching ip and port.
+    // If so returns 1, if not returns 0
+    if (is_valid_ip(ip1) && is_valid_ip(ip2) && is_valid_port(port1) && is_valid_port(port2)) {
+        return ((memcmp(ip1, ip2, 16) == 0) && (port1 == port2));
+    } else {
+        printf("Not valid ip or port to match\n");
+        return 0;
+    }
+    return 0;
 }
 
 
@@ -147,6 +183,7 @@ void handle_response(int clientfd, int request_command, char* request_body, int 
   // for a 2 it needs original request message and length to get filename for file to be
   // recieved.
   // TODO change reply_header from char array to ReplyHeader_t struct
+  // TODO - don't user header structs but just variables with proper names
 
   char buf[MAX_MSG_LEN];
   char reply_header[REPLY_HEADER_LEN];
@@ -159,7 +196,7 @@ void handle_response(int clientfd, int request_command, char* request_body, int 
   size_t n;
   //
   // If bytes being read, enter message parsing
-  if ((n = compsys_helper_readnb(&state, reply_header, REPLY_HEADER_LEN)) != 0) {
+  if ((n = compsys_helper_readnb(&state, reply_header, REPLY_HEADER_LEN)) > 0) {
 
     uint32_t reply_length = ntohl(*(uint32_t *)&reply_header[0]);
     reply_header_struct.length = reply_length;
@@ -169,8 +206,8 @@ void handle_response(int clientfd, int request_command, char* request_body, int 
     reply_header_struct.status = reply_status;
 
     // Reply status contains errors
-    if (reply_status > 3) {
-      printf("Error status code from peer\n");
+    if (reply_status > 1) {
+      printf("Error status code from peer %d\n", reply_status);
       switch (reply_status) {
           case 2:
               // Only for peer registration responses
@@ -220,14 +257,15 @@ void handle_response(int clientfd, int request_command, char* request_body, int 
             for (int i = 0; i < number_of_peers_in_response; i++) {
               NetworkAddress_t *peer =
                   make_network_addres_from_response(message_buf, i * 68);
-
-              if (is_in_network(network, peer, previous_peer_count) == 0) {
+              pthread_mutex_lock(&lock);
+              if (!is_in_network(network, peer, previous_peer_count)) {
                 int next_peer_place_in_network =
                     previous_peer_count + peers_added;
                 network[next_peer_place_in_network] = peer;
                 peer_count++;
                 peers_added++;
               }
+              pthread_mutex_unlock(&lock);
             }
 
             printf("Number of peers in network: %d\n", peer_count);
@@ -345,8 +383,17 @@ void handle_response(int clientfd, int request_command, char* request_body, int 
 
                 }
 
-                // Write file buffer to file
-                fwrite(file_buffer, 1, file_data_recieved, file);
+                // Check total message hash with total hash
+                hashdata_t total_message_hash;
+                get_data_sha(file_buffer, total_message_hash, file_data_recieved, SHA256_HASH_SIZE);
+                if (memcmp(total_message_hash, reply_block_total_hash, SHA256_HASH_SIZE) != 0) {
+                    // TODO - implement error handling
+                    printf("The hash of the total message and the provided total hash didn't match\n");
+                } else {
+                    // Write file buffer to file if hashes match
+                    fwrite(file_buffer, 1, file_data_recieved, file);
+                }
+                // Delete file if not ok?
                 fclose(file);
                 close(clientfd);
                 // Free memory
@@ -545,10 +592,10 @@ void* client_thread()
 
   // Update network with peer we are requesting connection to
   // TODO - Consider if it is right to do it here
-  pthread_mutex_lock(&lock);
-  network[peer_count] = peer_address;
-  peer_count++;
-  pthread_mutex_unlock(&lock);
+  //pthread_mutex_lock(&lock);
+  //network[peer_count] = peer_address;
+  //peer_count++;
+  //pthread_mutex_unlock(&lock);
 
   // Send registration request message to peer
   send_message(*peer_address, 1, "", 0);
@@ -779,11 +826,11 @@ void handle_register_message(RequestHeader_t* register_header, int connfd) {
         memcpy(new_peer->ip, register_header->ip, 16);
 
         // Generate network saved signature with random salt
-        char random_salt[SALT_LEN];
+        char random_salt[SALT_LEN+1];
         generate_random_salt(random_salt);
         // Terminate salt string with null-byte.
         // TODO - I don't know if it is necessary but handout did it in main
-        //random_salt[SALT_LEN] = '\0';
+        random_salt[SALT_LEN] = '\0';
         // TODO - We can probably generate signature directly into NetworkAddress
         hashdata_t* network_signature = (hashdata_t*) malloc(sizeof(hashdata_t));
 
@@ -794,6 +841,10 @@ void handle_register_message(RequestHeader_t* register_header, int connfd) {
         memcpy(new_peer->salt, random_salt, SALT_LEN);
         memcpy(new_peer->signature, network_signature, SHA256_HASH_SIZE);
         free(network_signature);
+        // Ved registrering:
+        printf("Registration - Salt: ");
+        for (int i = 0; i < 16; i++) printf("%02x", (unsigned char)new_peer->salt[i]);
+        printf("\n");
 
         // Add to network and increment peer count
         if (!is_in_network(network, new_peer, peer_count)) {
@@ -959,18 +1010,37 @@ void* handle_server_request(void* arg) {
     compsys_helper_readnb(&state, &request_body, request_body_length);
     printf("Handling server request with command: %d\n", request_command);
 
+    // Check if hashes match
+    // only if this is someone already registered.
+
+    //hashdata_t request_signature_hash;
+    //get_data_sha(request_body, request_signature_hash, request_body_length, SHA256_HASH_SIZE);
+    //if (memcmp(request_signature_hash, request_signature, SHA256_HASH_SIZE)) {
+    //    printf("Hashes of request message body didn't match. Resend request.\n");
+    //    send_error_message("Wrong signature", 4, request_connfd);
+    //}
+
+    NetworkAddress_t requesting_peer;
+    memcpy(&requesting_peer.ip, request_ip, 16);
+    requesting_peer.port = request_port;
+
     // Handle request based on request command
     if (request_command == 1) {
+        if (is_in_network(network, &requesting_peer, peer_count)) {
+            // If already registered send error response and stop.
+            send_error_message("Peer already registered in network\0", 2, request_connfd);
+            printf("Peer trying to register was already registered in network.\n");
+            return NULL;
+        }
+
         printf("Incoming registration request from IP: %s Port: %d\n", request_ip, request_port);
         if (request_body_length != 0) {
             printf("body contains message - which it shouldn't\n");
         }
         handle_register_message(request_header, request_connfd);
-
-    } else if (request_command == 2) {
-        printf("Incoming file request from IP: %s Port: %d\n", request_ip, request_port);
-        handle_file_request(request_header, request_connfd, request_body);
-
+        // Exit after handling the register message.
+        // handle_register_message sends out a response
+        return NULL;
     } else if (request_command == 3) {
         printf("Incoming inform request from IP: %s Port: %d\n", request_ip, request_port);
 
@@ -979,9 +1049,48 @@ void* handle_server_request(void* arg) {
             printf("Inform request body is the wrong length. It is: %d\n", request_body_length);
             send_error_message("", 7, request_connfd);
         }
+        return NULL;
     }
 
 
+    // if 2 check if peer is in network, and check signature
+    if (!is_in_network(network, &requesting_peer, peer_count)) {
+        // If not in network, send error message and stop.
+        send_error_message("Not registered in network.\0", 3, request_connfd);
+        printf("Peer requesting was not registered in network.\n");
+        return NULL;
+    } 
+
+    hashdata_t incoming_signature_hash;// = (hashdata_t*)malloc(sizeof(hashdata_t));
+    NetworkAddress_t* requesting_peer_info = malloc(sizeof(NetworkAddress_t));
+    int n = find_in_network(&requesting_peer, requesting_peer_info);
+    printf("requesting peer info ip and port %s:%d", requesting_peer_info->ip, requesting_peer_info->port);
+    // Ved verifikation:
+    printf("Verification - Salt: ");
+    for (int i = 0; i < 16; i++) printf("%02x", (unsigned char)requesting_peer_info->salt[i]);
+    printf("\n");
+    /* printf("Salt length is %lu\n", strlen(requesting_peer_info->salt)); */
+    /* printf("Salt is %s\n", requesting_peer_info->salt); */
+    /* printf("Sig is %s\n", requesting_peer_info->signature); */
+    //printf("Requesting peer stored signature %s and salt %s\n", requesting_peer_info.signature, requesting_peer_info.salt);
+    get_signature(request_signature, SHA256_HASH_SIZE, requesting_peer_info->salt, &incoming_signature_hash);
+    printf("made signature\n");
+
+    if (memcmp(incoming_signature_hash, requesting_peer_info->signature, SHA256_HASH_SIZE) != 0) {
+        printf("Password mismatch\n");
+        send_error_message("Password mismatch\0", 4, request_connfd);
+        return NULL;
+    }
+    printf("compared signatures\n");
+    if (request_command == 2) {
+        printf("Incoming file request from IP: %s Port: %d\n", request_ip, request_port);
+        handle_file_request(request_header, request_connfd, request_body);
+
+    } else {
+        printf("Bad request command\n");
+        send_error_message("Bad request command\n", 7, request_connfd);
+            }
+    printf("reached end of server request\n");
     return NULL;
 }
 void* server_thread() {
@@ -1068,6 +1177,11 @@ int main(int argc, char **argv)
     // Most correctly, we should randomly generate our salts, but this can make
     // repeated testing difficult so feel free to use the hard coded salt below
     char salt[SALT_LEN+1] = "0123456789ABCDEF\0";
+    // Ved registrering:
+    printf("Init - Salt: ");
+    for (int i = 0; i < 16; i++) printf("%02x", (unsigned char)salt[i]);
+    printf("\n");
+
     //generate_random_salt(salt);
     memcpy(my_address->salt, salt, SALT_LEN);
 
@@ -1091,6 +1205,10 @@ int main(int argc, char **argv)
     // Wait for them to complete. 
     pthread_join(client_thread_id, NULL);
     pthread_join(server_thread_id, NULL);
+
+    // TODO - Function to free all network address pointers in network[]
+
+    free(network);
 
     exit(EXIT_SUCCESS);
 }
