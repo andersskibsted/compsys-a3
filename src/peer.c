@@ -404,7 +404,7 @@ void handle_response(int clientfd, int request_command, char* request_body, int 
   }
 }
 
-void send_message(NetworkAddress_t peer_address, int command,
+int send_message(NetworkAddress_t peer_address, int command,
                   char *request_body, int request_len) {
 // Simple send message over network.
 // Creates a new connection and sends a message.
@@ -422,6 +422,10 @@ void send_message(NetworkAddress_t peer_address, int command,
 
   // Create client socket and connect
   int clientfd = compsys_helper_open_clientfd(peer_ip, peer_port);
+  if (clientfd < 0) {
+      printf("Connection error, try again\n");
+      return -1;
+  }
 
   // Create and populate request header
   // TODO - could maybe just be on stack
@@ -470,6 +474,7 @@ void send_message(NetworkAddress_t peer_address, int command,
   }
   // close connection after response has been handled
   close(clientfd);
+  return 1;
 }
 
 
@@ -567,39 +572,42 @@ void send_error_message(char* error_message, int error_code, int connfd) {
  */ 
 void* client_thread()
 {
-  char peer_ip[IP_LEN];
-  fprintf(stdout, "Enter peer IP to connect to: ");
-  scanf("%16s", peer_ip);
-  
-  // Clean up ip string as otherwise some extra chars can sneak in.
-  for (int i=strlen(peer_ip); i<IP_LEN; i++)
-      {
-        peer_ip[i] = '\0';
-      }
+    int registration_succes = 0;
+    while (registration_succes < 1) {
+        char peer_ip[IP_LEN];
+        fprintf(stdout, "Enter peer IP to connect to: ");
+        scanf("%16s", peer_ip);
 
-  char peer_port[PORT_STR_LEN];
-  fprintf(stdout, "Enter peer port to connect to: ");
-  scanf("%16s", peer_port);
-  
-  // Clean up port string as otherwise some extra chars can sneak in.
-  for (int i=strlen(peer_port); i<PORT_STR_LEN; i++) {
-    peer_port[i] = '\0';
+        // Clean up ip string as otherwise some extra chars can sneak in.
+        for (int i=strlen(peer_ip); i<IP_LEN; i++)
+            {
+                peer_ip[i] = '\0';
+            }
+
+        char peer_port[PORT_STR_LEN];
+        fprintf(stdout, "Enter peer port to connect to: ");
+        scanf("%16s", peer_port);
+
+        // Clean up port string as otherwise some extra chars can sneak in.
+        for (int i=strlen(peer_port); i<PORT_STR_LEN; i++) {
+            peer_port[i] = '\0';
+            }
+
+        NetworkAddress_t* peer_address = malloc(sizeof(NetworkAddress_t));
+        memcpy(peer_address->ip, peer_ip, IP_LEN);
+        peer_address->port = atoi(peer_port);
+
+        // Update network with peer we are requesting connection to
+        // TODO - Consider if it is right to do it here
+        //pthread_mutex_lock(&lock);
+        //network[peer_count] = peer_address;
+        //peer_count++;
+        //pthread_mutex_unlock(&lock);
+
+        // Send registration request message to peer
+        // TODO - maybe it can return -1 on error and try another connection
+        registration_succes = send_message(*peer_address, 1, "", 0);
     }
-
-  NetworkAddress_t* peer_address = malloc(sizeof(NetworkAddress_t));
-  memcpy(peer_address->ip, peer_ip, IP_LEN);
-  peer_address->port = atoi(peer_port);
-
-  // Update network with peer we are requesting connection to
-  // TODO - Consider if it is right to do it here
-  //pthread_mutex_lock(&lock);
-  //network[peer_count] = peer_address;
-  //peer_count++;
-  //pthread_mutex_unlock(&lock);
-
-  // Send registration request message to peer
-  send_message(*peer_address, 1, "", 0);
-
 
 
   while (1) {
