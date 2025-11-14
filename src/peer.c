@@ -39,21 +39,43 @@ typedef struct request_thread_args {
     int request_connfd;
 } request_thread_args_t;
 
-void get_signature(void *password, int password_len, char *salt,
+void print_salt(char* salt) {
+     printf("Printing - Salt: ");
+        for (int i = 0; i < 16; i++) printf("%c", (char)salt[i]);
+    printf("\n");
+}
+void print_signature(char* sig) {
+     printf("Printing - Signature: ");
+        for (int i = 0; i < SHA256_HASH_SIZE; i++) printf("%02x", (unsigned char)sig[i]);
+    printf("\n");
+}
+
+void get_signature(char *password, int password_len, char *salt,
                    hashdata_t* hash) {
-    printf("beginnig of sig func\n");
-  size_t length = SALT_LEN + password_len;
+  size_t length = SALT_LEN + password_len;//actual_password_len;
+  /* printf("%zu\n", length); */
   char password_with_salt[length];
-  printf("going to copy password\n");
-  memcpy(password_with_salt, password, password_len);
+  memcpy(password_with_salt, password, password_len);//actual_password_len);
+  /* for (int i = 0; i<length; i++) { */
+  /*     printf("%c", (char) password_with_salt[i]); */
+  /* } */
+  /* printf("\n"); */
+  /* for (int i= 0; i<16; i++) { */
+  /*     printf("%c", (char) salt[i]); */
+  /* } */
+  /* printf("\n"); */
   //strcpy(password_with_salt, password);
-  printf("going to concatenate\n");
   memcpy(&password_with_salt[password_len], salt, SALT_LEN);
   //strcat(password_with_salt, salt);
 
-  printf("going to make actual hash\n");
-  get_data_sha(password_with_salt, hash, length, SHA256_HASH_SIZE);
+  /* for (int i = 0; i<length; i++) { */
+  /*     printf("%c", (char) password_with_salt[i]); */
+  /* } */
+  /* printf("\n"); */
+  /* printf("password with salt %s\n", password_with_salt); */
+  get_data_sha(password_with_salt, *hash, length, SHA256_HASH_SIZE);
 }
+
 // Function to shuffle numbers in array
 // Used to shuffle order blocks are send in.
 // Fisher-Yates shuffle
@@ -82,9 +104,7 @@ void print_peers(char *data, size_t data_len) {
     printf("Peer number: %d\n", i);
     printf("IP: %s\n", first_peer_ip);
     printf("Port: %d\n", first_peer_port);
-    printf("Signture: %s\n", first_peer_signature);
-    printf("Salt: %s\n", first_peer_salt);
-    
+
   }
 }
 
@@ -168,6 +188,8 @@ int is_same_ip_and_port(char* ip1, int port1, char* ip2, int port2) {
 NetworkAddress_t* return_random_peer() {
     // Returns a random peer from the network array of stored peers.
     // Does not return it self
+    // TODO - make sure it works now that my address and network[0] are
+    // kinda the same
     uint32_t random_peer_number = rand() % peer_count;
     if (is_same_peer(network[random_peer_number], my_address)) {
             random_peer_number = (random_peer_number + 1) % peer_count;
@@ -440,7 +462,17 @@ int send_message(NetworkAddress_t peer_address, int command,
   }
 
   memcpy(req_head->ip, my_address->ip, IP_LEN);
-  memcpy(req_head->signature, my_address->signature, SHA256_HASH_SIZE);
+  if (command == 1) {
+      // If sending a regisration message, send original signature. As it is not
+      // being checked.
+      memcpy(req_head->signature, my_address->signature, SHA256_HASH_SIZE);
+  } else {
+      // Else send the network saved signature recieved when registering
+      // with the network.
+      NetworkAddress_t myself;
+      find_in_network(my_address, &myself);
+      memcpy(req_head->signature, my_address->signature, SHA256_HASH_SIZE);
+  }
 
   // Assemble request header and body
   // TODO - could maybe just be on stack
@@ -539,8 +571,9 @@ void send_error_message(char* error_message, int error_code, int connfd) {
     // TODO - understand why we're hashing all the time!
     // And if this here is necessary
     hashdata_t block_hash;
-    char random_salt[SALT_LEN];
+    char random_salt[SALT_LEN+1];
     generate_random_salt(random_salt);
+    random_salt[SALT_LEN] = '\0';
     get_data_sha(message_buffer, block_hash, message_length, SHA256_HASH_SIZE);
     memcpy(reply_header->block_hash, block_hash, SHA256_HASH_SIZE);
     memcpy(reply_header->total_hash, block_hash, SHA256_HASH_SIZE);
@@ -573,7 +606,7 @@ void send_error_message(char* error_message, int error_code, int connfd) {
 void* client_thread()
 {
     int registration_succes = 0;
-    while (registration_succes < 1) {
+    while ((registration_succes < 1) && (peer_count < 2)) {
         char peer_ip[IP_LEN];
         fprintf(stdout, "Enter peer IP to connect to: ");
         scanf("%16s", peer_ip);
@@ -803,14 +836,17 @@ void handle_inform_message(RequestHeader_t* inform_header, char* inform_body) {
         uint32_t port_network_order;
         memcpy(&port_network_order, &inform_body[16], 4);
         new_peer->port = ntohl(port_network_order);
-
+        char salt[SALT_LEN+1];
         memcpy(new_peer->signature, &inform_body[20], 32);
-        memcpy(new_peer->salt, &inform_body[52], 16);
+        /* memcpy(new_peer->salt, &inform_body[52], 16); */
+        memcpy(salt, &inform_body[52], 16);
+        salt[SALT_LEN] = '\0';
+        memcpy(new_peer->salt, salt, SALT_LEN);
         network[peer_count] = new_peer;
         peer_count++;
 
         printf("Updating network on inform. Number of peers %d\n", peer_count);
-        printf("%s:%d with salt %s\n", new_peer->ip, new_peer->port, new_peer->salt);
+        printf("%s:%d with salt %s\n", new_peer->ip, new_peer->port, salt);
         for (int n = 0; n<peer_count; n++) {
             print_network_address(network[n]);
         }
@@ -841,7 +877,7 @@ void handle_register_message(RequestHeader_t* register_header, int connfd) {
         // Create network signature from register request signature and random salt.
         // Now hardcoded to length 32, as that is what it is, but it probably
         // should use a macro or constant.
-        get_signature(register_header->signature, 32, random_salt, network_signature);
+        get_signature(register_header->signature, SHA256_HASH_SIZE, random_salt, network_signature);
         memcpy(new_peer->salt, random_salt, SALT_LEN);
         memcpy(new_peer->signature, network_signature, SHA256_HASH_SIZE);
         free(network_signature);
@@ -873,11 +909,16 @@ void handle_register_message(RequestHeader_t* register_header, int connfd) {
         // that is it is in the network, but it's probably ok, as it can check
         // for it self and sort it out.
         for (int i = 0; i < peer_count; i++) {
+            printf("packing response to register\n");
             uint32_t port = htonl(network[i]->port);
             memcpy(&response_body[i*68], &network[i]->ip, 16);
             memcpy(&response_body[i*68+16], &port, 4);
+            printf("port %d\n", ntohl(port));
             memcpy(&response_body[i*68+20], network[i]->signature, 32);
+            print_signature(&response_body[i*68+20]);
             memcpy(&response_body[i*68+52], network[i]->salt, 16);
+            print_salt(&response_body[i*68+52]);
+
         }
 
         // Send the response for register message
@@ -1027,6 +1068,35 @@ void* handle_server_request(void* arg) {
 
     // Handle request based on request command
     if (request_command == 1) {
+        // if there is no one in network, i must be the first peer
+        // must be locked if there is a rapid influx of registrations to same peer
+        pthread_mutex_lock(&lock);
+        if (peer_count == 0) {
+            // Generate network saved signature of my signature
+            // to be send out to the peers.
+            printf("Assuming i'm the first peer\n");
+            char random_salt[SALT_LEN+1];
+            generate_random_salt(random_salt);
+            random_salt[SALT_LEN] = '\0';
+            hashdata_t network_saved_signature;
+            get_signature(my_address->signature, SHA256_HASH_SIZE, random_salt, &network_saved_signature);
+            NetworkAddress_t* my_self_in_network = malloc(sizeof(NetworkAddress_t));
+            my_self_in_network->port = my_address->port;
+            printf("First peer my port %d\n", my_self_in_network->port);
+            memcpy(my_self_in_network->ip, my_address->ip, IP_LEN);
+            printf("First peer my IP %s\n", my_self_in_network->ip);
+            memcpy(my_self_in_network->salt, random_salt, SALT_LEN);
+            memcpy(my_self_in_network->signature, network_saved_signature, SHA256_HASH_SIZE);
+            network[0] = my_self_in_network;
+            peer_count++;
+            print_network_address(network[0]);
+            printf("First peer - Network signature: ");
+            for (int i = 0; i < SHA256_HASH_SIZE; i++) printf("%02x", (unsigned char)my_self_in_network->signature[i]);
+            printf("\n");
+
+        }
+        pthread_mutex_unlock(&lock);
+
         if (is_in_network(network, &requesting_peer, peer_count)) {
             // If already registered send error response and stop.
             send_error_message("Peer already registered in network\0", 2, request_connfd);
@@ -1068,17 +1138,30 @@ void* handle_server_request(void* arg) {
     hashdata_t incoming_signature_hash;// = (hashdata_t*)malloc(sizeof(hashdata_t));
     NetworkAddress_t* requesting_peer_info = malloc(sizeof(NetworkAddress_t));
     int n = find_in_network(&requesting_peer, requesting_peer_info);
-    printf("requesting peer info ip and port %s:%d", requesting_peer_info->ip, requesting_peer_info->port);
+    printf("requesting peer info ip and port %s:%d\n", requesting_peer_info->ip, requesting_peer_info->port);
+    /* printf("Salt as string %s\n"); */
     // Ved verifikation:
     printf("Verification - Salt: ");
-    for (int i = 0; i < 16; i++) printf("%02x", (unsigned char)requesting_peer_info->salt[i]);
+    for (int i = 0; i < 16; i++) printf("%c", (char)requesting_peer_info->salt[i]);
+    printf("\n");
+    printf("Verification from network[] - signature: ");
+    for (int i = 0; i < SHA256_HASH_SIZE; i++) printf("%02x", (unsigned char)requesting_peer_info->signature[i]);
+    printf("\n");
+    printf("Verification - recieved signature: ");
+    for (int i = 0; i < SHA256_HASH_SIZE; i++) printf("%02x", (unsigned char)request_signature[i]);
     printf("\n");
     /* printf("Salt length is %lu\n", strlen(requesting_peer_info->salt)); */
     /* printf("Salt is %s\n", requesting_peer_info->salt); */
     /* printf("Sig is %s\n", requesting_peer_info->signature); */
     //printf("Requesting peer stored signature %s and salt %s\n", requesting_peer_info.signature, requesting_peer_info.salt);
     get_signature(request_signature, SHA256_HASH_SIZE, requesting_peer_info->salt, &incoming_signature_hash);
-    printf("made signature\n");
+     printf("From network[] - signature: ");
+    for (int i = 0; i < SHA256_HASH_SIZE; i++) printf("%02x", (unsigned char)requesting_peer_info->signature[i]);
+    printf("\n");
+    printf("Newly hashed - signature: ");
+    for (int i = 0; i < SHA256_HASH_SIZE; i++) printf("%02x", (unsigned char)incoming_signature_hash[i]);
+    printf("\n");
+
 
     if (memcmp(incoming_signature_hash, requesting_peer_info->signature, SHA256_HASH_SIZE) != 0) {
         printf("Password mismatch\n");
@@ -1191,22 +1274,28 @@ int main(int argc, char **argv)
     memcpy(my_address->salt, salt, SALT_LEN);
 
     // Create a signature from password and salt, and store in signature    
-    hashdata_t *signature = (hashdata_t *)malloc(sizeof(hashdata_t));
-    get_signature(password, PASSWORD_LEN, salt, signature);
+    hashdata_t signature;// = (hashdata_t *)malloc(sizeof(hashdata_t));
+    get_signature(password, strlen(password), salt, &signature);
 
     // Now hardcoded to 50 but there is probably an elegant way to do it
     network = malloc(sizeof(NetworkAddress_t*) * 50);
     memcpy(my_address->signature, signature, SHA256_HASH_SIZE);
-    network[0] = my_address;
-    peer_count++;
+    printf("Init - Signature: ");
+    for (int i = 0; i < SHA256_HASH_SIZE; i++) printf("%02x", (unsigned char)signature[i]);
+    printf("\n");
+
+
+    //network[0] = my_address;
+    //peer_count++;
 
     
     // Setup the client and server threads 
     pthread_t client_thread_id;
     pthread_t server_thread_id;
     pthread_create(&client_thread_id, NULL, client_thread, NULL);
+    printf("Client started\n");
     pthread_create(&server_thread_id, NULL, server_thread, NULL);
-
+    printf("Server started\n");
     // Wait for them to complete. 
     pthread_join(client_thread_id, NULL);
     pthread_join(server_thread_id, NULL);
