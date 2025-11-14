@@ -2,7 +2,7 @@
 GCC=gcc -g -Wall -Wextra -pedantic -std=gnu11
 LD_FLAGS= -lpthread -lm
 
-all: peer
+all: peer hasher
 
 rebuild: clean all
 
@@ -13,6 +13,9 @@ common.o: common.c common.h
 	$(GCC) -c $< -o $@
 
 peer: peer.c peer.h common.o compsys_helpers.o sha256.o
+	$(GCC) $< *.o -o $@ $(LD_FLAGS)
+
+hasher: hasher.c peer.h common.o compsys_helpers.o sha256.o
 	$(GCC) $< *.o -o $@ $(LD_FLAGS)
 
 sha256.o : sha256.c sha256.h

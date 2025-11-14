@@ -8,6 +8,7 @@
 #include <math.h>
 #include <netdb.h>
 #include <sys/_endian.h>
+#include <sys/_pthread/_pthread_attr_t.h>
 #include <sys/_pthread/_pthread_mutex_t.h>
 #include <sys/_pthread/_pthread_t.h>
 #include <sys/_types/_size_t.h>
@@ -34,6 +35,9 @@ NetworkAddress_t *my_address;
 NetworkAddress_t** network = NULL;
 uint32_t peer_count = 0;
 pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+int not_alone = 0;
+int active_threads = 0;
+
 
 typedef struct request_thread_args {
     int request_connfd;
@@ -50,29 +54,11 @@ void print_signature(char* sig) {
     printf("\n");
 }
 
-void get_signature(char *password, int password_len, char *salt,
-                   hashdata_t* hash) {
-  size_t length = SALT_LEN + password_len;//actual_password_len;
-  /* printf("%zu\n", length); */
+void get_signature(char *password, int password_len, char *salt, hashdata_t* hash) {
+  size_t length = SALT_LEN + password_len;
   char password_with_salt[length];
-  memcpy(password_with_salt, password, password_len);//actual_password_len);
-  /* for (int i = 0; i<length; i++) { */
-  /*     printf("%c", (char) password_with_salt[i]); */
-  /* } */
-  /* printf("\n"); */
-  /* for (int i= 0; i<16; i++) { */
-  /*     printf("%c", (char) salt[i]); */
-  /* } */
-  /* printf("\n"); */
-  //strcpy(password_with_salt, password);
+  memcpy(password_with_salt, password, password_len);
   memcpy(&password_with_salt[password_len], salt, SALT_LEN);
-  //strcat(password_with_salt, salt);
-
-  /* for (int i = 0; i<length; i++) { */
-  /*     printf("%c", (char) password_with_salt[i]); */
-  /* } */
-  /* printf("\n"); */
-  /* printf("password with salt %s\n", password_with_salt); */
   get_data_sha(password_with_salt, *hash, length, SHA256_HASH_SIZE);
 }
 
@@ -122,12 +108,9 @@ NetworkAddress_t* make_network_addres_from_response(void *data, int offset) {
   // body, and only reads info of one peer
 
   NetworkAddress_t* new_peer = malloc(sizeof(NetworkAddress_t));
-  char peer_ip[16];
   memcpy(new_peer->ip, &data[offset], 16);
   new_peer->port = ntohl(*(uint32_t *)&data[offset + 16]);
-  char peer_signature[32];
   memcpy(new_peer->signature, &data[offset + 20], 32);
-  char peer_salt[16];
   memcpy(new_peer->salt, &data[offset + 52], 16);
 
   return new_peer;
@@ -209,7 +192,6 @@ void handle_response(int clientfd, int request_command, char* request_body, int 
 
   char buf[MAX_MSG_LEN];
   char reply_header[REPLY_HEADER_LEN];
-  ReplyHeader_t reply_header_struct;
   compsys_helper_state_t state;
   int max_body_length = MAX_MSG_LEN - sizeof(ReplyHeader_t);
 
@@ -221,11 +203,9 @@ void handle_response(int clientfd, int request_command, char* request_body, int 
   if ((n = compsys_helper_readnb(&state, reply_header, REPLY_HEADER_LEN)) > 0) {
 
     uint32_t reply_length = ntohl(*(uint32_t *)&reply_header[0]);
-    reply_header_struct.length = reply_length;
 
     // Check reply code for erros
     uint32_t reply_status = ntohl(*(uint32_t *)&reply_header[4]);
-    reply_header_struct.status = reply_status;
 
     // Reply status contains errors
     if (reply_status > 1) {
@@ -249,15 +229,11 @@ void handle_response(int clientfd, int request_command, char* request_body, int 
 
         // Parsing reply block header into variables and then into fields
         uint32_t reply_block_number = ntohl(*(uint32_t *)&reply_header[8]);
-        reply_header_struct.this_block = reply_block_number;
         uint32_t reply_block_count = ntohl(*(uint32_t *)&reply_header[12]);
-        reply_header_struct.block_count = reply_block_count;
         char reply_block_hash[32];
         memcpy(reply_block_hash, &reply_header[16], 32);
-        memcpy(reply_header_struct.block_hash, reply_block_hash, SHA256_HASH_SIZE);
         char reply_block_total_hash[32];
         memcpy(reply_block_total_hash, &reply_header[48], 32);
-        memcpy(reply_header_struct.total_hash, reply_block_total_hash, SHA256_HASH_SIZE);
 
         if (request_command == 1) {
             // If 1, read and parse reply message and put new peers in network
@@ -269,7 +245,7 @@ void handle_response(int clientfd, int request_command, char* request_body, int 
             char message_hash[32];
             get_data_sha(message_buf, message_hash, reply_length, 32);
             if (memcmp(message_hash, reply_block_hash, 32) != 0) {
-              printf("Hashes not identical, something is wrong\n");
+              printf("Hashes not identical, something is in response handling\n");
             }
 
             int number_of_peers_in_response = reply_length / 68;
@@ -279,6 +255,7 @@ void handle_response(int clientfd, int request_command, char* request_body, int 
             for (int i = 0; i < number_of_peers_in_response; i++) {
               NetworkAddress_t *peer =
                   make_network_addres_from_response(message_buf, i * 68);
+
               pthread_mutex_lock(&lock);
               if (!is_in_network(network, peer, previous_peer_count)) {
                 int next_peer_place_in_network =
@@ -287,6 +264,7 @@ void handle_response(int clientfd, int request_command, char* request_body, int 
                 peer_count++;
                 peers_added++;
               }
+              not_alone = 1;
               pthread_mutex_unlock(&lock);
             }
 
@@ -317,7 +295,6 @@ void handle_response(int clientfd, int request_command, char* request_body, int 
             char message_buf[reply_length];
             size_t bytes_received =
                 compsys_helper_readnb(&state, message_buf, reply_length);
-            printf("Read %zu bytes, reply length is %d\n", bytes_received, reply_length);
 
             // check if message hash is identical to hash from header
             // TODO - mismatch should have consequenses
@@ -338,13 +315,13 @@ void handle_response(int clientfd, int request_command, char* request_body, int 
                 // We already recieved response header in the beginning.
                 int blocks_recieved = 1;
                 int total_blocks = reply_block_count;
-                int data_recieved = 0;
+                //int data_recieved = 0;
                 int file_data_recieved = max_body_length;
                 int bytes_read = 0;
 
                 int potential_data_to_be_recieved = total_blocks * MAX_MSG_LEN;
                 char file_buffer[potential_data_to_be_recieved];
-                int current_block = reply_header_struct.this_block;
+                int current_block = reply_block_number;
 
                 // Copy first read message into buffer, so we're ready for
                 // the while loop
@@ -355,7 +332,7 @@ void handle_response(int clientfd, int request_command, char* request_body, int 
                 while (blocks_recieved < total_blocks) {
 
                     // Read next header
-                    ReplyHeader_t* reply_header_while = malloc(sizeof(ReplyHeader_t));
+                    //ReplyHeader_t* reply_header_while = malloc(sizeof(ReplyHeader_t));
                     char reply_header_buffer[80];
                     int total_read = 0;
                     // This is the way it's done in robust_server.c from lecture code
@@ -368,21 +345,35 @@ void handle_response(int clientfd, int request_command, char* request_body, int 
                         }
                         total_read += bytes_read;
                     }
-                    // copy header into buffer and put all data into fields of struct
-                    memcpy(reply_header_while, reply_header_buffer, 80);
-                    reply_header_while->length = ntohl(reply_header_while->length);
-                    reply_header_while->status = ntohl(reply_header_while->status);
-                    reply_header_while->this_block = ntohl(reply_header_while->this_block);
-                    reply_header_while->block_count = ntohl(reply_header_while->block_count);
+                     // Parsing reply block header into variables
+                    uint32_t body_length = ntohl(*(uint32_t*)&reply_header_buffer[0]);
+                    //uint32_t status = ntohl(*(uint32_t*)&reply_header_buffer[4]);
+                    current_block = ntohl(*(uint32_t *)&reply_header_buffer[8]);
+                    total_blocks = ntohl(*(uint32_t *)&reply_header_buffer[12]);
+                    char block_hash[32];
+                    memcpy(block_hash, &reply_header_buffer[16], 32);
+                    char total_hash[32];
+                    memcpy(total_hash, &reply_header_buffer[48], 32);
 
-                    //current_block = reply_header_while->this_block;
-                    data_recieved += bytes_read;
+                    //data_recieved += bytes_read;
 
                     // Read message body for current block
-                    //int body_length = reply_header_while->length;
-                    char message_body_buffer[reply_header_while->length];
-                    bytes_read = compsys_helper_readnb(
-                        &state, message_body_buffer, reply_header_while->length);
+                    char message_body_buffer[body_length];
+                    int total_body_read = 0;
+                    while (total_body_read < body_length) {
+
+                        bytes_read = compsys_helper_readnb(
+                            &state, message_body_buffer, body_length);
+                        total_body_read += bytes_read;
+                    }
+
+                    // Check the hash of this part of the message
+                    hashdata_t message_hash;
+                    get_data_sha(message_body_buffer, message_hash, body_length, SHA256_HASH_SIZE);
+                    if (memcmp(message_hash, block_hash, SHA256_HASH_SIZE) != 0) {
+                        // TODO - should be error handled
+                       printf("Hashes of message body of block %d / %d did not match\n", current_block, total_blocks);
+                    }
 
                     if (bytes_read <= 0) {
                         // maybe should have consequenses
@@ -392,16 +383,15 @@ void handle_response(int clientfd, int request_command, char* request_body, int 
                     }
 
                     blocks_recieved++;
-                    data_recieved += bytes_read;
+                    //data_recieved += bytes_read;
                     // To keep track of the final file size
                     // Maybe there is a more robust way
                     file_data_recieved += bytes_read;
 
                     // Copy to message buffer to file buffer
-                    memcpy(&file_buffer[(reply_header_while->this_block) * max_body_length],
-                           message_body_buffer, reply_header_while->length);
-                    // TODO - Free each time, or maybe just keep reply_header_while on stack.
-                    free(reply_header_while);
+                    memcpy(&file_buffer[(current_block) * max_body_length],
+                           message_body_buffer, body_length);
+                    printf("Read and copied block %d\n", current_block);
 
                 }
 
@@ -419,7 +409,7 @@ void handle_response(int clientfd, int request_command, char* request_body, int 
                 fclose(file);
                 close(clientfd);
                 // Free memory
-                // TODO
+                // TODO ?
             }
         }
     }
@@ -431,16 +421,10 @@ int send_message(NetworkAddress_t peer_address, int command,
 // Simple send message over network.
 // Creates a new connection and sends a message.
 // Creates header, and assembles header and body to message
-// TODO - Maybe peer_address should be passed as pointer
 
   char *peer_ip = peer_address.ip;
   char peer_port[16];
   sprintf(peer_port, "%d", peer_address.port);
-  // TODO - remove
-  /* if (command == 3) { */
-  /*     //int request_body_port; */
-  /*     //memcpy(&request_body_port, &request_body[16], 4); */
-  /* } */
 
   // Create client socket and connect
   int clientfd = compsys_helper_open_clientfd(peer_ip, peer_port);
@@ -450,54 +434,32 @@ int send_message(NetworkAddress_t peer_address, int command,
   }
 
   // Create and populate request header
-  // TODO - could maybe just be on stack
-  RequestHeader_t *req_head = malloc(sizeof(RequestHeader_t));
-
-  req_head->port = htonl(my_address->port);
-  req_head->command = htonl(command);
-
-  // TODO - find a way to remove this
-  if (command != 1) {
-      req_head->length = htonl(request_len);
-  }
-
-  memcpy(req_head->ip, my_address->ip, IP_LEN);
-  if (command == 1) {
-      // If sending a regisration message, send original signature. As it is not
-      // being checked.
-      memcpy(req_head->signature, my_address->signature, SHA256_HASH_SIZE);
-  } else {
-      // Else send the network saved signature recieved when registering
-      // with the network.
-      NetworkAddress_t myself;
-      find_in_network(my_address, &myself);
-      memcpy(req_head->signature, my_address->signature, SHA256_HASH_SIZE);
-  }
+  RequestHeader_t req_head;
+  req_head.port = htonl(my_address->port);
+  req_head.command = htonl(command);
+  memcpy(req_head.ip, my_address->ip, IP_LEN);
+  req_head.length = htonl(request_len);
+  memcpy(req_head.signature, my_address->signature, SHA256_HASH_SIZE);
 
   // Assemble request header and body
-  // TODO - could maybe just be on stack
-  char *send_buffer = malloc(sizeof(RequestHeader_t) + request_len);
-  if (send_buffer == NULL) {
-      // TODO - maybe it should have consequences
-    printf("Request buffer failed\n");
-  }
+  char send_buffer[sizeof(RequestHeader_t) + request_len];
 
   // Putting request header and message body in buffer to be send
-  memcpy(&send_buffer[0], req_head, sizeof(RequestHeader_t));
+  memcpy(&send_buffer[0], &req_head, sizeof(RequestHeader_t));
   memcpy(&send_buffer[sizeof(RequestHeader_t)], request_body, request_len);
 
   size_t total_message_length = request_len + sizeof(RequestHeader_t);
+
   // Send request
-  // TODO - while loop maybe
-  if (compsys_helper_writen(clientfd, send_buffer, total_message_length) < 1) {
+  int bytes_send = 0;
+  while (bytes_send < total_message_length) {
+      int n = compsys_helper_writen(clientfd, send_buffer, total_message_length);
+      if (n < 0) {
       // TODO - proper error handling
-    printf("Error, no bytes send for inform or file request\n");
+          printf("Error in sending for inform or file request\n");
+      }
+      bytes_send += n;
   }
-
-  // free allocated memory for request header and send buffer
-  free(req_head);
-  free(send_buffer);
-
 
   // Handle response if relevant.
   // Command 3 is inform and doesn't expect response
@@ -521,7 +483,7 @@ void send_error_message(char* error_message, int error_code, int connfd) {
     // TODO - message_buffer to be allocated in the size needed,
     // depending on message.
 
-    char* message_buffer = malloc(100);
+    char* message_buffer[255];
     int message_length = 0;
     switch (error_code) {
         case 2:
@@ -545,7 +507,7 @@ void send_error_message(char* error_message, int error_code, int connfd) {
         case 5:
             printf("Bad request. Cannot be fullfilled right now.\n");
             char* message_buffer5 = "Bad request. Cannot be fullfilled right now.\0";
-            message_length = strlen(message_buffer);
+            message_length = strlen(message_buffer5);
             memcpy(message_buffer, message_buffer5, message_length);
             break;
         case 6:
@@ -563,34 +525,28 @@ void send_error_message(char* error_message, int error_code, int connfd) {
         default:
             break;
     }
-    ReplyHeader_t* reply_header = malloc(sizeof(ReplyHeader_t));
-    reply_header->length = htonl(message_length);
-    reply_header->status = htonl(error_code);
-    reply_header->this_block = htonl(1);
-    reply_header->block_count = htonl(1);
-    // TODO - understand why we're hashing all the time!
-    // And if this here is necessary
+    ReplyHeader_t reply_header;;
+    reply_header.length = htonl(message_length);
+    reply_header.status = htonl(error_code);
+    reply_header.this_block = htonl(1);
+    reply_header.block_count = htonl(1);
+
     hashdata_t block_hash;
-    char random_salt[SALT_LEN+1];
-    generate_random_salt(random_salt);
-    random_salt[SALT_LEN] = '\0';
     get_data_sha(message_buffer, block_hash, message_length, SHA256_HASH_SIZE);
-    memcpy(reply_header->block_hash, block_hash, SHA256_HASH_SIZE);
-    memcpy(reply_header->total_hash, block_hash, SHA256_HASH_SIZE);
-    // TODO - simplify. Structs are just bytes, so they can be copied
-    // directly - but they should be so this might be better
+    memcpy(reply_header.block_hash, block_hash, SHA256_HASH_SIZE);
+    memcpy(reply_header.total_hash, block_hash, SHA256_HASH_SIZE);
+
+
     char outputbuffer[sizeof(ReplyHeader_t) + message_length];
-    memcpy(&outputbuffer[0], &reply_header->length, 4);
-    memcpy(&outputbuffer[4], &reply_header->status, 4);
-    memcpy(&outputbuffer[8], &reply_header->this_block, 4);
-    memcpy(&outputbuffer[12], &reply_header->block_count, 4);
-    memcpy(&outputbuffer[16], &reply_header->block_hash, 32);
-    memcpy(&outputbuffer[48], &reply_header->total_hash, 32);
+    memcpy(&outputbuffer[0], &reply_header.length, 4);
+    memcpy(&outputbuffer[4], &reply_header.status, 4);
+    memcpy(&outputbuffer[8], &reply_header.this_block, 4);
+    memcpy(&outputbuffer[12], &reply_header.block_count, 4);
+    memcpy(&outputbuffer[16], &reply_header.block_hash, 32);
+    memcpy(&outputbuffer[48], &reply_header.total_hash, 32);
     memcpy(&outputbuffer[80], message_buffer, message_length);
     compsys_helper_writen(connfd, message_buffer, message_length);
 
-    free(reply_header);
-    free(message_buffer);
 }
 
 
@@ -605,8 +561,9 @@ void send_error_message(char* error_message, int error_code, int connfd) {
  */ 
 void* client_thread()
 {
-    int registration_succes = 0;
-    while ((registration_succes < 1) && (peer_count < 2)) {
+    while (!not_alone) {
+        // Prompts again if no connection, or if someone registered
+        // with this peer.
         char peer_ip[IP_LEN];
         fprintf(stdout, "Enter peer IP to connect to: ");
         scanf("%16s", peer_ip);
@@ -630,16 +587,8 @@ void* client_thread()
         memcpy(peer_address->ip, peer_ip, IP_LEN);
         peer_address->port = atoi(peer_port);
 
-        // Update network with peer we are requesting connection to
-        // TODO - Consider if it is right to do it here
-        //pthread_mutex_lock(&lock);
-        //network[peer_count] = peer_address;
-        //peer_count++;
-        //pthread_mutex_unlock(&lock);
-
         // Send registration request message to peer
-        // TODO - maybe it can return -1 on error and try another connection
-        registration_succes = send_message(*peer_address, 1, "", 0);
+        send_message(*peer_address, 1, "", 0);
     }
 
 
@@ -647,8 +596,11 @@ void* client_thread()
 
     char filename_buffer[255];
     int chars_read = 0;
-    fprintf(stdout, "Enter file name to get: ");
+    fprintf(stdout, "Enter file name to get or type quit to exit: ");
     scanf("%s%n", filename_buffer, &chars_read);
+    if (strcmp(filename_buffer, "quit") == 0) {
+        break;
+    }
     NetworkAddress_t* random_peer = return_random_peer();
     char filename[chars_read];
     memcpy(filename, filename_buffer, chars_read);
@@ -706,10 +658,18 @@ void send_response(uint32_t connfd, uint32_t status, char* response_body, int re
 
         // TODO - implement while loop to make sure all is written
         // as compsys_helper might be non blocking
-        int n =
-            compsys_helper_writen(connfd, outputbuffer, total_response_length);
-        printf("%d bytes written and send, total response length is %zu\n", n,
-               total_response_length);
+        int bytes_send = 0;
+        //while (bytes_send < total_response_length) {
+            int n =
+                compsys_helper_writen(connfd, outputbuffer, total_response_length);
+            printf("%d bytes written and send, total response length is %zu\n", n,
+                   total_response_length);
+            if (n < 0) {
+                printf("Error in sending response\n");
+
+            }
+            bytes_send += n;
+        //}
 
         // Free output buffer when data is send
         free(outputbuffer);
@@ -724,8 +684,8 @@ void send_response(uint32_t connfd, uint32_t status, char* response_body, int re
         // Allocate memory for all blocks in a buffer.
         // TODO - check for errors in allocation - this can
         // probably be done on stack.
-        block_buffer = malloc((number_of_blocks) * MAX_MSG_LEN); //+ size_of_last_block + sizeof(ReplyHeader_t));
-
+        //char block_buffer[number_of_blocks * MAX_MSG_LEN]; //+ size_of_last_block + sizeof(ReplyHeader_t));
+        block_buffer = malloc(number_of_blocks * MAX_MSG_LEN);
 
         // Populate reply_header for first message.
         reply_header->block_count = htonl(number_of_blocks);
@@ -742,7 +702,6 @@ void send_response(uint32_t connfd, uint32_t status, char* response_body, int re
             memcpy(block_data, &response_body[i*max_body_length], max_body_length);
 
             // Allocate and create block hash to be put in this specific header
-            // TODO - check if hash is done correctly
             hashdata_t block_hash;
             get_data_sha(block_data, block_hash, max_body_length, SHA256_HASH_SIZE);
             memcpy(reply_header->block_hash, block_hash, SHA256_HASH_SIZE);
@@ -751,14 +710,13 @@ void send_response(uint32_t connfd, uint32_t status, char* response_body, int re
             // Copy this block (reply_header + block_data) to the block_buffer. It should be ok,
             // since data is copied, and when these pointers go out of scope
             // data is copied, not just referenced.
-            /* memcpy(&block_buffer[i*MAX_MSG_LEN], &reply_header->length, 4); */
-            /* memcpy(&block_buffer[i*MAX_MSG_LEN + 4], &reply_header->status, 4); */
-            /* memcpy(&block_buffer[i*MAX_MSG_LEN + 8], &reply_header->this_block, 4); */
-            /* memcpy(&block_buffer[i*MAX_MSG_LEN + 12], &reply_header->block_count, 4); */
-            /* memcpy(&block_buffer[i*MAX_MSG_LEN + 16], &reply_header->block_hash, 32); */
-            /* memcpy(&block_buffer[i*MAX_MSG_LEN + 48], &reply_header->total_hash, 32); */
+            memcpy(&block_buffer[i*MAX_MSG_LEN], &reply_header->length, 4);
+            memcpy(&block_buffer[i*MAX_MSG_LEN + 4], &reply_header->status, 4);
+            memcpy(&block_buffer[i*MAX_MSG_LEN + 8], &reply_header->this_block, 4);
+            memcpy(&block_buffer[i*MAX_MSG_LEN + 12], &reply_header->block_count, 4);
+            memcpy(&block_buffer[i*MAX_MSG_LEN + 16], &reply_header->block_hash, 32);
+            memcpy(&block_buffer[i*MAX_MSG_LEN + 48], &reply_header->total_hash, 32);
 
-            memcpy(&block_buffer[i*MAX_MSG_LEN], reply_header, sizeof(ReplyHeader_t));
             memcpy(&block_buffer[i*MAX_MSG_LEN + sizeof(ReplyHeader_t)], block_data, max_body_length);
         }
 
@@ -780,6 +738,7 @@ void send_response(uint32_t connfd, uint32_t status, char* response_body, int re
         // TODO - copy member fields and not entire struct
         memcpy(&block_buffer[(number_of_blocks-1)*MAX_MSG_LEN], reply_header, sizeof(ReplyHeader_t));
         memcpy(&block_buffer[(number_of_blocks-1)*MAX_MSG_LEN + sizeof(ReplyHeader_t)], block_data, size_of_last_block);
+
 
         // Random order for sending blocks
         // Seed random generator
@@ -823,7 +782,6 @@ void send_response(uint32_t connfd, uint32_t status, char* response_body, int re
     }
 
     free(reply_header);
-    free(block_buffer);
 }
 void handle_inform_message(RequestHeader_t* inform_header, char* inform_body) {
     // inform_body must be 68 bytes!!
@@ -836,17 +794,14 @@ void handle_inform_message(RequestHeader_t* inform_header, char* inform_body) {
         uint32_t port_network_order;
         memcpy(&port_network_order, &inform_body[16], 4);
         new_peer->port = ntohl(port_network_order);
-        char salt[SALT_LEN+1];
+        char salt[SALT_LEN];
         memcpy(new_peer->signature, &inform_body[20], 32);
-        /* memcpy(new_peer->salt, &inform_body[52], 16); */
         memcpy(salt, &inform_body[52], 16);
-        salt[SALT_LEN] = '\0';
         memcpy(new_peer->salt, salt, SALT_LEN);
         network[peer_count] = new_peer;
         peer_count++;
 
-        printf("Updating network on inform. Number of peers %d\n", peer_count);
-        printf("%s:%d with salt %s\n", new_peer->ip, new_peer->port, salt);
+        printf("Updating network on inform.\n Number of peers %d\n", peer_count);
         for (int n = 0; n<peer_count; n++) {
             print_network_address(network[n]);
         }
@@ -866,25 +821,18 @@ void handle_register_message(RequestHeader_t* register_header, int connfd) {
         memcpy(new_peer->ip, register_header->ip, 16);
 
         // Generate network saved signature with random salt
-        char random_salt[SALT_LEN+1];
+        char random_salt[SALT_LEN];
         generate_random_salt(random_salt);
-        // Terminate salt string with null-byte.
-        // TODO - I don't know if it is necessary but handout did it in main
-        random_salt[SALT_LEN] = '\0';
         // TODO - We can probably generate signature directly into NetworkAddress
-        hashdata_t* network_signature = (hashdata_t*) malloc(sizeof(hashdata_t));
+        /* hashdata_t* network_signature = (hashdata_t*) malloc(sizeof(hashdata_t)); */
 
         // Create network signature from register request signature and random salt.
         // Now hardcoded to length 32, as that is what it is, but it probably
         // should use a macro or constant.
-        get_signature(register_header->signature, SHA256_HASH_SIZE, random_salt, network_signature);
+        get_signature(register_header->signature, SHA256_HASH_SIZE, random_salt, &new_peer->signature);
         memcpy(new_peer->salt, random_salt, SALT_LEN);
-        memcpy(new_peer->signature, network_signature, SHA256_HASH_SIZE);
-        free(network_signature);
-        // Ved registrering:
-        printf("Registration - Salt: ");
-        for (int i = 0; i < 16; i++) printf("%02x", (unsigned char)new_peer->salt[i]);
-        printf("\n");
+        /* memcpy(new_peer->signature, network_signature, SHA256_HASH_SIZE); */
+        /* free(network_signature); */
 
         // Add to network and increment peer count
         if (!is_in_network(network, new_peer, peer_count)) {
@@ -898,10 +846,11 @@ void handle_register_message(RequestHeader_t* register_header, int connfd) {
         for (int i = 0; i < peer_count; i++) {
             print_network_address(network[i]);
         }
+        // We are not alone anymore
+        not_alone = 1;
+
+        // Prepare a response to registration
         size_t response_length = 68 * peer_count;
-        // TODO - maybe this can be on stack? Unless
-        // send_response needs after it's out of scope
-        //char* response_body = malloc(response_length);
         char response_body[response_length];
 
         // Copy entire network into buffer to send as response
@@ -909,16 +858,11 @@ void handle_register_message(RequestHeader_t* register_header, int connfd) {
         // that is it is in the network, but it's probably ok, as it can check
         // for it self and sort it out.
         for (int i = 0; i < peer_count; i++) {
-            printf("packing response to register\n");
             uint32_t port = htonl(network[i]->port);
             memcpy(&response_body[i*68], &network[i]->ip, 16);
             memcpy(&response_body[i*68+16], &port, 4);
-            printf("port %d\n", ntohl(port));
             memcpy(&response_body[i*68+20], network[i]->signature, 32);
-            print_signature(&response_body[i*68+20]);
             memcpy(&response_body[i*68+52], network[i]->salt, 16);
-            print_salt(&response_body[i*68+52]);
-
         }
 
         // Send the response for register message
@@ -929,12 +873,8 @@ void handle_register_message(RequestHeader_t* register_header, int connfd) {
         for (int peer = 0; peer < peer_count; peer++) {
             if (!is_same_peer(network[peer], new_peer) && !is_same_peer(network[peer], my_address)) {
               // Do not send inform message to newly registered peer
-              // TODO - Needs more robust handling, as this is just because
-              // newly registered peer is the last in the network array
 
               // Allocate memory for inform message
-              // TODO - check if this stays ok, or if
-              // send_message loses the data and should be on heap. Ok for now.
               char inform_body[sizeof(NetworkAddress_t)];
 
 
@@ -961,18 +901,19 @@ void handle_file_request(RequestHeader_t* file_request_header, int connfd, char*
     char* buffer;
     uint32_t file_size;
     size_t bytes_read;
-    ReplyHeader_t* reply_header;
-    hashdata_t block_hash;
+    //ReplyHeader_t* reply_header;
+    //hashdata_t block_hash;
 
     // Get name of file from request
-    // TODO - Should be validated and have security
     memcpy(filename, file_request_body, body_length);
     filename[body_length] = '\0';
 
     // Open requested file
     file = fopen(filename, "r");
     if (file == NULL) {
-        perror("Could not open requested file\n");
+        printf("Could not open requested file\n");
+        send_error_message("File doesn't exist in peer\n", 5, connfd);
+        return;
     }
 
     // Find file size
@@ -981,7 +922,6 @@ void handle_file_request(RequestHeader_t* file_request_header, int connfd, char*
     rewind(file);
 
     // Allocate buffer for file content
-    // TODO - rename to file_buffer
     buffer = (char*) malloc(file_size + 1);
     // Check for error in allocation
     if (buffer == NULL) {
@@ -1000,7 +940,7 @@ void handle_file_request(RequestHeader_t* file_request_header, int connfd, char*
 
     printf("Sending file %s as response to request. bytes_read: %zu and file size is %d\n", filename, bytes_read, file_size);
     send_response(connfd, 1, buffer, bytes_read);
-    // TODO - Check if it is ok to free here or send response should do it.
+
     free(buffer);
 
 
@@ -1019,15 +959,22 @@ void* handle_server_request(void* arg) {
     free(arg);
 
     // Allocate memory for request header
-    RequestHeader_t* request_header = malloc(sizeof(RequestHeader_t));
+   // RequestHeader_t* request_header = malloc(sizeof(RequestHeader_t));
+    RequestHeader_t request_header;
     compsys_helper_state_t state;
     char request_header_buffer[REQUEST_HEADER_LEN];// = malloc(REQUEST_HEADER_LEN);
 
     // read request header and
     // TODO implement error handling
-    // TODO implement while loop
     compsys_helper_readinitb(&state, request_connfd);
-    compsys_helper_readnb(&state, request_header_buffer, REQUEST_HEADER_LEN);
+    int bytes_read = 0;
+    while (bytes_read < REQUEST_HEADER_LEN) {
+        int n = compsys_helper_readnb(&state, request_header_buffer, REQUEST_HEADER_LEN);
+        if (n < 0) {
+            printf("Error reading incoming server request header\n");
+        }
+        bytes_read += n;
+    }
 
     // Parse request header data and populate
     // request header struct
@@ -1041,18 +988,20 @@ void* handle_server_request(void* arg) {
     uint32_t request_body_length = ntohl(*(uint32_t*)&request_header_buffer[56]);
 
     // Put it all into request header struct
-    request_header->length = request_body_length;
-    request_header->command = request_command;
-    memcpy(request_header->ip, request_ip, 16);
-    request_header->port = request_port;
-    memcpy(request_header->signature, request_signature, 32);
+    request_header.length = request_body_length;
+    request_header.command = request_command;
+    memcpy(request_header.ip, request_ip, 16);
+    request_header.port = request_port;
+    memcpy(request_header.signature, request_signature, 32);
 
-    // TODO - remove when simplifying
-    //free(request_header_buffer);
 
     if (!is_valid_ip(request_ip) || !is_valid_port(request_port)) {
         printf("Request was not with a valid IP or port.\n");
         send_error_message("", 7, request_connfd);
+
+        pthread_mutex_lock(&lock);
+        active_threads--;
+        pthread_mutex_unlock(&lock);
         return NULL;
     }
     // Read request body - if there is any
@@ -1082,17 +1031,11 @@ void* handle_server_request(void* arg) {
             get_signature(my_address->signature, SHA256_HASH_SIZE, random_salt, &network_saved_signature);
             NetworkAddress_t* my_self_in_network = malloc(sizeof(NetworkAddress_t));
             my_self_in_network->port = my_address->port;
-            printf("First peer my port %d\n", my_self_in_network->port);
             memcpy(my_self_in_network->ip, my_address->ip, IP_LEN);
-            printf("First peer my IP %s\n", my_self_in_network->ip);
             memcpy(my_self_in_network->salt, random_salt, SALT_LEN);
             memcpy(my_self_in_network->signature, network_saved_signature, SHA256_HASH_SIZE);
             network[0] = my_self_in_network;
             peer_count++;
-            print_network_address(network[0]);
-            printf("First peer - Network signature: ");
-            for (int i = 0; i < SHA256_HASH_SIZE; i++) printf("%02x", (unsigned char)my_self_in_network->signature[i]);
-            printf("\n");
 
         }
         pthread_mutex_unlock(&lock);
@@ -1101,6 +1044,10 @@ void* handle_server_request(void* arg) {
             // If already registered send error response and stop.
             send_error_message("Peer already registered in network\0", 2, request_connfd);
             printf("Peer trying to register was already registered in network.\n");
+
+            pthread_mutex_lock(&lock);
+            active_threads--;
+            pthread_mutex_unlock(&lock);
             return NULL;
         }
 
@@ -1108,18 +1055,25 @@ void* handle_server_request(void* arg) {
         if (request_body_length != 0) {
             printf("body contains message - which it shouldn't\n");
         }
-        handle_register_message(request_header, request_connfd);
+        handle_register_message(&request_header, request_connfd);
         // Exit after handling the register message.
         // handle_register_message sends out a response
+
+        pthread_mutex_lock(&lock);
+        active_threads--;
+        pthread_mutex_unlock(&lock);
         return NULL;
     } else if (request_command == 3) {
-        printf("Incoming inform request from IP: %s Port: %d\n", request_ip, request_port);
 
-        handle_inform_message(request_header, request_body);
+        handle_inform_message(&request_header, request_body);
         if ((request_body_length % 68) != 0) {
             printf("Inform request body is the wrong length. It is: %d\n", request_body_length);
             send_error_message("", 7, request_connfd);
         }
+
+        pthread_mutex_lock(&lock);
+        active_threads--;
+        pthread_mutex_unlock(&lock);
         return NULL;
     }
 
@@ -1129,6 +1083,9 @@ void* handle_server_request(void* arg) {
         // If not in network, send error message and stop.
         send_error_message("Not registered in network.\0", 3, request_connfd);
         printf("Peer requesting was not registered in network.\n");
+        pthread_mutex_lock(&lock);
+        active_threads--;
+        pthread_mutex_unlock(&lock);
         return NULL;
     }
 
@@ -1137,84 +1094,68 @@ void* handle_server_request(void* arg) {
 
     hashdata_t incoming_signature_hash;// = (hashdata_t*)malloc(sizeof(hashdata_t));
     NetworkAddress_t* requesting_peer_info = malloc(sizeof(NetworkAddress_t));
-    int n = find_in_network(&requesting_peer, requesting_peer_info);
-    printf("requesting peer info ip and port %s:%d\n", requesting_peer_info->ip, requesting_peer_info->port);
-    /* printf("Salt as string %s\n"); */
-    // Ved verifikation:
-    printf("Verification - Salt: ");
-    for (int i = 0; i < 16; i++) printf("%c", (char)requesting_peer_info->salt[i]);
-    printf("\n");
-    printf("Verification from network[] - signature: ");
-    for (int i = 0; i < SHA256_HASH_SIZE; i++) printf("%02x", (unsigned char)requesting_peer_info->signature[i]);
-    printf("\n");
-    printf("Verification - recieved signature: ");
-    for (int i = 0; i < SHA256_HASH_SIZE; i++) printf("%02x", (unsigned char)request_signature[i]);
-    printf("\n");
-    /* printf("Salt length is %lu\n", strlen(requesting_peer_info->salt)); */
-    /* printf("Salt is %s\n", requesting_peer_info->salt); */
-    /* printf("Sig is %s\n", requesting_peer_info->signature); */
-    //printf("Requesting peer stored signature %s and salt %s\n", requesting_peer_info.signature, requesting_peer_info.salt);
+    find_in_network(&requesting_peer, requesting_peer_info);
+
     get_signature(request_signature, SHA256_HASH_SIZE, requesting_peer_info->salt, &incoming_signature_hash);
-     printf("From network[] - signature: ");
-    for (int i = 0; i < SHA256_HASH_SIZE; i++) printf("%02x", (unsigned char)requesting_peer_info->signature[i]);
-    printf("\n");
-    printf("Newly hashed - signature: ");
-    for (int i = 0; i < SHA256_HASH_SIZE; i++) printf("%02x", (unsigned char)incoming_signature_hash[i]);
-    printf("\n");
 
 
     if (memcmp(incoming_signature_hash, requesting_peer_info->signature, SHA256_HASH_SIZE) != 0) {
         printf("Password mismatch\n");
         send_error_message("Password mismatch\0", 4, request_connfd);
+
+        pthread_mutex_lock(&lock);
+        active_threads--;
+        pthread_mutex_unlock(&lock);
         return NULL;
     }
-    printf("compared signatures\n");
     if (request_command == 2) {
         printf("Incoming file request from IP: %s Port: %d\n", request_ip, request_port);
-        handle_file_request(request_header, request_connfd, request_body);
+        handle_file_request(&request_header, request_connfd, request_body);
 
     } else {
         printf("Bad request command\n");
         send_error_message("Bad request command\n", 7, request_connfd);
-            }
-    printf("reached end of server request\n");
+    }
+    pthread_mutex_lock(&lock);
+    active_threads--;
+    pthread_mutex_unlock(&lock);
     return NULL;
 }
 void* server_thread() {
     // Main server thread. Listening for connections
     // and spawns threads to handle requests.
-  int listenfd;
   int connfd;
   char local_port[16];
-  //int* connfd_ptr = malloc(sizeof(int));
-  //request_thread_args_t* request_thread_arg = malloc(sizeof(request_thread_args_t));
+  int listenfd;
 
   // Incoming connection threads
   // TODO - find a way to just allocate memory when needed.
   //pthread_t* connection_threads = malloc(sizeof(pthread_t) * 15);
   // Maybe this is ok, since server thread will never finish, unless
   // we exit program. And we call detach(self) in threads
-  int max_requests = 15;
+  int max_requests = 25;
   pthread_t connection_threads[max_requests];
   struct sockaddr_storage clientaddr;
   struct sockaddr_in listen_address;
   int lis_addr_len = sizeof(listen_address);
   sprintf(local_port, "%d", my_address->port);
   listenfd = compsys_helper_open_listenfd(local_port);
-  int requests = 0;
+
   while (1) {
       // Check if max requests have been reached.
-      // TODO - find a way to make book keeping on active requests.
-      // Maybe global variable - remember mutex
-      while (requests < max_requests) {
+      while (active_threads < max_requests) {
       // Accept incomint connections
-        if ((connfd = accept(listenfd, (struct sockaddr*) &clientaddr, (socklen_t*) &lis_addr_len)) < 0) {
-            printf("Error in reading incoming connection in server thread\n");
-        }
+          if ((connfd = accept(listenfd, (struct sockaddr*) &clientaddr, (socklen_t*) &lis_addr_len)) < 0) {
+              printf("error in accepting server request\n");
+          }
         request_thread_args_t* arg = malloc(sizeof(request_thread_args_t));
         arg->request_connfd = connfd;
-        pthread_create(&connection_threads[requests], NULL, handle_server_request, (void*)arg);
-        requests++;
+        pthread_mutex_lock(&lock);
+        pthread_create(&connection_threads[active_threads], NULL, handle_server_request, (void*)arg);
+        // thread copies and frees its arg, so no free needed here.
+
+        active_threads++;
+        pthread_mutex_unlock(&lock);
       }
   }
   // You should never see this printed in your finished implementation
@@ -1223,6 +1164,12 @@ void* server_thread() {
   return NULL;
 }
 
+void free_addresses_in_network() {
+    for (int i = 0; i < peer_count; i++) {
+        free(network[i]);
+    }
+    free(network);
+}
 
 int main(int argc, char **argv)
 {
@@ -1265,31 +1212,17 @@ int main(int argc, char **argv)
     // repeated testing difficult so feel free to use the hard coded salt below
     char salt[SALT_LEN+1] = "0123456789ABCDEF\0";
     // Ved registrering:
-    printf("Init - Salt: ");
-    for (int i = 0; i < 16; i++) printf("%02x", (unsigned char)salt[i]);
-    printf("\n");
-    printf("Salt as string %s\n", salt);
-
-    //generate_random_salt(salt);
     memcpy(my_address->salt, salt, SALT_LEN);
 
     // Create a signature from password and salt, and store in signature    
-    hashdata_t signature;// = (hashdata_t *)malloc(sizeof(hashdata_t));
+    hashdata_t signature;
     get_signature(password, strlen(password), salt, &signature);
 
     // Now hardcoded to 50 but there is probably an elegant way to do it
     network = malloc(sizeof(NetworkAddress_t*) * 50);
     memcpy(my_address->signature, signature, SHA256_HASH_SIZE);
-    printf("Init - Signature: ");
-    for (int i = 0; i < SHA256_HASH_SIZE; i++) printf("%02x", (unsigned char)signature[i]);
-    printf("\n");
 
-
-    //network[0] = my_address;
-    //peer_count++;
-
-    
-    // Setup the client and server threads 
+    // Setup the client and server threads
     pthread_t client_thread_id;
     pthread_t server_thread_id;
     pthread_create(&client_thread_id, NULL, client_thread, NULL);
@@ -1300,9 +1233,9 @@ int main(int argc, char **argv)
     pthread_join(client_thread_id, NULL);
     pthread_join(server_thread_id, NULL);
 
-    // TODO - Function to free all network address pointers in network[]
-
-    free(network);
-
+    // Function to free all network address pointers in network[]
+    free_addresses_in_network();
+    //free(network);
+    printf("Exit program\n");
     exit(EXIT_SUCCESS);
 }
