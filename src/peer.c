@@ -102,18 +102,18 @@ void print_network_address(NetworkAddress_t* address) {
 // TODO - Should it do something to data in place, so it is more obvious who
 // allocates the memory? Just remember to free network[] when done this way
 //
-NetworkAddress_t* make_network_addres_from_response(void *data, int offset) {
+void make_network_addres_from_response(void *data, NetworkAddress_t* new_peer, int offset) {
   // Parse data read in from response to a register request.
   // offset is because it is used in a loop, so it reads from entire message
   // body, and only reads info of one peer
 
-  NetworkAddress_t* new_peer = malloc(sizeof(NetworkAddress_t));
+  //NetworkAddress_t* new_peer = malloc(sizeof(NetworkAddress_t));
   memcpy(new_peer->ip, &data[offset], 16);
   new_peer->port = ntohl(*(uint32_t *)&data[offset + 16]);
   memcpy(new_peer->signature, &data[offset + 20], 32);
   memcpy(new_peer->salt, &data[offset + 52], 16);
 
-  return new_peer;
+  //return new_peer;
 }
 
 int is_in_network(NetworkAddress_t **network, NetworkAddress_t* peer, int number_of_peers) {
@@ -216,11 +216,19 @@ void handle_response(int clientfd, int request_command, char* request_body, int 
               printf("Peer already exists\n");
               break;
           case 3:
-              printf("Peer is missing, hasn't registered yet\n");
+              printf("Peer is missing in network we requested from, hasn't registered yet\n");
               break;
           case 4:
               printf("Password mismatch\n");
               break;
+        case 5:
+              printf("Peer to busy to handle request or file didn't exist\n");
+              break;
+        case 6:
+              printf("Unknow error occured at peer.\n");
+              break;
+        case 7:
+              printf("Request was malformed, please try again.\n");
           default:
               break;
               }
@@ -253,8 +261,8 @@ void handle_response(int clientfd, int request_command, char* request_body, int 
 
             int peers_added = 0;
             for (int i = 0; i < number_of_peers_in_response; i++) {
-              NetworkAddress_t *peer =
-                  make_network_addres_from_response(message_buf, i * 68);
+              NetworkAddress_t *peer = malloc(sizeof(NetworkAddress_t));
+              make_network_addres_from_response(message_buf, peer, i * 68);
 
               pthread_mutex_lock(&lock);
               if (!is_in_network(network, peer, previous_peer_count)) {
@@ -525,6 +533,7 @@ void send_error_message(char* error_message, int error_code, int connfd) {
         default:
             break;
     }
+  // Assemble reply header and send reply message with error code
     ReplyHeader_t reply_header;;
     reply_header.length = htonl(message_length);
     reply_header.status = htonl(error_code);
@@ -959,7 +968,6 @@ void* handle_server_request(void* arg) {
     free(arg);
 
     // Allocate memory for request header
-   // RequestHeader_t* request_header = malloc(sizeof(RequestHeader_t));
     RequestHeader_t request_header;
     compsys_helper_state_t state;
     char request_header_buffer[REQUEST_HEADER_LEN];// = malloc(REQUEST_HEADER_LEN);
@@ -1012,115 +1020,139 @@ void* handle_server_request(void* arg) {
 
 
     NetworkAddress_t requesting_peer;
-    memcpy(&requesting_peer.ip, request_ip, 16);
+    memcpy(&requesting_peer.ip, request_ip, IP_LEN);
     requesting_peer.port = request_port;
 
     // Handle request based on request command
     if (request_command == 1) {
-        // if there is no one in network, i must be the first peer
+        // if there is no one in network, this must be the first peer
         // must be locked if there is a rapid influx of registrations to same peer
-        pthread_mutex_lock(&lock);
         if (peer_count == 0) {
-            // Generate network saved signature of my signature
-            // to be send out to the peers.
-            printf("Assuming i'm the first peer\n");
-            char random_salt[SALT_LEN+1];
-            generate_random_salt(random_salt);
-            random_salt[SALT_LEN] = '\0';
-            hashdata_t network_saved_signature;
-            get_signature(my_address->signature, SHA256_HASH_SIZE, random_salt, &network_saved_signature);
-            NetworkAddress_t* my_self_in_network = malloc(sizeof(NetworkAddress_t));
-            my_self_in_network->port = my_address->port;
-            memcpy(my_self_in_network->ip, my_address->ip, IP_LEN);
-            memcpy(my_self_in_network->salt, random_salt, SALT_LEN);
-            memcpy(my_self_in_network->signature, network_saved_signature, SHA256_HASH_SIZE);
-            network[0] = my_self_in_network;
-            peer_count++;
+          pthread_mutex_lock(&lock);
 
+          // Generate network saved signature of my signature
+          // to be send out to the peers.
+          printf("Assuming i'm the first peer\n");
+          char random_salt[SALT_LEN + 1];
+          generate_random_salt(random_salt);
+          random_salt[SALT_LEN] = '\0';
+          hashdata_t network_saved_signature;
+          get_signature(my_address->signature, SHA256_HASH_SIZE, random_salt,
+                        &network_saved_signature);
+          NetworkAddress_t *my_self_in_network =
+              malloc(sizeof(NetworkAddress_t));
+          my_self_in_network->port = my_address->port;
+          memcpy(my_self_in_network->ip, my_address->ip, IP_LEN);
+          memcpy(my_self_in_network->salt, random_salt, SALT_LEN);
+          memcpy(my_self_in_network->signature, network_saved_signature,
+                 SHA256_HASH_SIZE);
+          network[0] = my_self_in_network;
+          peer_count++;
+
+          pthread_mutex_unlock(&lock);
         }
-        pthread_mutex_unlock(&lock);
 
         if (is_in_network(network, &requesting_peer, peer_count)) {
-            // If already registered send error response and stop.
+            // If registering peer already registered send error response and stop.
             send_error_message("Peer already registered in network\0", 2, request_connfd);
             printf("Peer trying to register was already registered in network.\n");
 
-            pthread_mutex_lock(&lock);
-            active_threads--;
-            pthread_mutex_unlock(&lock);
-            return NULL;
-        }
+            /* pthread_mutex_lock(&lock); */
+            /* active_threads--; */
+            /* pthread_mutex_unlock(&lock); */
+            /* return NULL; */
+        } else {
 
-        printf("Incoming registration request from IP: %s Port: %d\n", request_ip, request_port);
-        if (request_body_length != 0) {
+          printf("Incoming registration request from IP: %s Port: %d\n", request_ip, request_port);
+          if (request_body_length != 0) {
             printf("body contains message - which it shouldn't\n");
+          }
+          handle_register_message(&request_header, request_connfd);
         }
-        handle_register_message(&request_header, request_connfd);
-        // Exit after handling the register message.
-        // handle_register_message sends out a response
+      // Exit after handling the register message.
+      // handle_register_message sends out a response
+      pthread_mutex_lock(&lock);
+      active_threads--;
+      pthread_mutex_unlock(&lock);
+      return NULL;
 
-        pthread_mutex_lock(&lock);
-        active_threads--;
-        pthread_mutex_unlock(&lock);
-        return NULL;
-    } else if (request_command == 3) {
+    } else if (request_command == 2) {
+      // File request
+      // Calculate hash of incoming signature
+      hashdata_t incoming_signature_hash;
+      NetworkAddress_t *requesting_peer_info = malloc(sizeof(NetworkAddress_t));
+      find_in_network(&requesting_peer, requesting_peer_info);
 
-        handle_inform_message(&request_header, request_body);
-        if ((request_body_length % 68) != 0) {
-            printf("Inform request body is the wrong length. It is: %d\n", request_body_length);
-            send_error_message("", 7, request_connfd);
-        }
+      get_signature(request_signature, SHA256_HASH_SIZE,
+                    requesting_peer_info->salt, &incoming_signature_hash);
 
-        pthread_mutex_lock(&lock);
-        active_threads--;
-        pthread_mutex_unlock(&lock);
-        return NULL;
-    }
-
-
-    // if 2 check if peer is in network, and check signature
-    if (!is_in_network(network, &requesting_peer, peer_count)) {
+      if (!is_in_network(network, &requesting_peer, peer_count)) {
         // If not in network, send error message and stop.
         send_error_message("Not registered in network.\0", 3, request_connfd);
         printf("Peer requesting was not registered in network.\n");
-        pthread_mutex_lock(&lock);
-        active_threads--;
-        pthread_mutex_unlock(&lock);
-        return NULL;
-    }
+        /* pthread_mutex_lock(&lock); */
+        /* active_threads--; */
+        /* pthread_mutex_unlock(&lock); */
+        /* return NULL; */
 
-        // Check if hashes match
-    // only if this is someone already registered.
-
-    hashdata_t incoming_signature_hash;// = (hashdata_t*)malloc(sizeof(hashdata_t));
-    NetworkAddress_t* requesting_peer_info = malloc(sizeof(NetworkAddress_t));
-    find_in_network(&requesting_peer, requesting_peer_info);
-
-    get_signature(request_signature, SHA256_HASH_SIZE, requesting_peer_info->salt, &incoming_signature_hash);
-
-
-    if (memcmp(incoming_signature_hash, requesting_peer_info->signature, SHA256_HASH_SIZE) != 0) {
+      // Check if hashes match
+      } else if (memcmp(incoming_signature_hash, requesting_peer_info->signature,
+                 SHA256_HASH_SIZE) != 0) {
+        // Hashes didn't match, send error
         printf("Password mismatch\n");
         send_error_message("Password mismatch\0", 4, request_connfd);
 
+        /* pthread_mutex_lock(&lock); */
+        /* active_threads--; */
+        /* pthread_mutex_unlock(&lock); */
+        /* return NULL; */
+      } else {
+        // If no error handle file request by passing on to handle_file_request
+        printf("Incoming file request from IP: %s Port: %d\n", request_ip,
+               request_port);
+        handle_file_request(&request_header, request_connfd, request_body);
+      }
+      // exit
+      pthread_mutex_lock(&lock);
+      active_threads--;
+      pthread_mutex_unlock(&lock);
+      return NULL;
+
+    }   else if (request_command == 3) {
+      // Inform request
+      // If body is the wrong length, send error, else handle it
+      // by passing it on to function. After that exit.
+        if ((request_body_length % 68) != 0) {
+            printf("Inform request body is the wrong length. It is: %d\n", request_body_length);
+            send_error_message("", 7, request_connfd);
+
+        } else if (is_in_network(network, &requesting_peer, peer_count)) {
+          // if not registered, send error - even though it's just inform
+          send_error_message("Not registered in network.\0", 3, request_connfd);
+          printf("Peer requesting was not registered in network.\n");
+
+        } else {
+          handle_inform_message(&request_header, request_body);
+        }
+
         pthread_mutex_lock(&lock);
         active_threads--;
         pthread_mutex_unlock(&lock);
         return NULL;
-    }
-    if (request_command == 2) {
-        printf("Incoming file request from IP: %s Port: %d\n", request_ip, request_port);
-        handle_file_request(&request_header, request_connfd, request_body);
 
     } else {
-        printf("Bad request command\n");
-        send_error_message("Bad request command\n", 7, request_connfd);
+
+      printf("Incoming request command wasn't understood\n");
+      send_error_message("", 7, request_connfd);
+
+      pthread_mutex_lock(&lock);
+      active_threads--;
+      pthread_mutex_unlock(&lock);
+      return NULL;
     }
-    pthread_mutex_lock(&lock);
-    active_threads--;
-    pthread_mutex_unlock(&lock);
-    return NULL;
 }
+
+
 void* server_thread() {
     // Main server thread. Listening for connections
     // and spawns threads to handle requests.
