@@ -37,7 +37,8 @@ uint32_t peer_count = 0;
 pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 int not_alone = 0;
 int active_threads = 0;
-
+int recent_identical_requests = 0;
+char recent_file_request[100];
 
 typedef struct request_thread_args {
     int request_connfd;
@@ -180,7 +181,7 @@ NetworkAddress_t* return_random_peer() {
     return network[random_peer_number];
 }
 
-void handle_response(int clientfd, int request_command, char* request_body, int request_len) {
+int handle_response(int clientfd, int request_command, char* request_body, int request_len) {
 
   // Handling the response
   // For now this takes care of all three kinds of requests
@@ -189,6 +190,7 @@ void handle_response(int clientfd, int request_command, char* request_body, int 
   // recieved.
   // TODO change reply_header from char array to ReplyHeader_t struct
   // TODO - don't user header structs but just variables with proper names
+  // TODO - handle file not found error status
 
   char buf[MAX_MSG_LEN];
   char reply_header[REPLY_HEADER_LEN];
@@ -200,12 +202,14 @@ void handle_response(int clientfd, int request_command, char* request_body, int 
   size_t n;
   //
   // If bytes being read, enter message parsing
+  printf("Just before reading response header\n");
   if ((n = compsys_helper_readnb(&state, reply_header, REPLY_HEADER_LEN)) > 0) {
-
+      printf("read %zu bytes\n", n);
     uint32_t reply_length = ntohl(*(uint32_t *)&reply_header[0]);
 
     // Check reply code for erros
     uint32_t reply_status = ntohl(*(uint32_t *)&reply_header[4]);
+    printf("Reply status %d\n", reply_status);
 
     // Reply status contains errors
     if (reply_status > 1) {
@@ -222,7 +226,8 @@ void handle_response(int clientfd, int request_command, char* request_body, int 
               printf("Password mismatch\n");
               break;
         case 5:
-              printf("Peer to busy to handle request or file didn't exist\n");
+              printf("Peer to busy to handle request or file didn't exist, trying again\n");
+              return 0;
               break;
         case 6:
               printf("Unknow error occured at peer.\n");
@@ -422,6 +427,7 @@ void handle_response(int clientfd, int request_command, char* request_body, int 
         }
     }
   }
+  return 1;
 }
 
 int send_message(NetworkAddress_t peer_address, int command,
@@ -429,7 +435,7 @@ int send_message(NetworkAddress_t peer_address, int command,
 // Simple send message over network.
 // Creates a new connection and sends a message.
 // Creates header, and assembles header and body to message
-
+    int status = 1;
   char *peer_ip = peer_address.ip;
   char peer_port[16];
   sprintf(peer_port, "%d", peer_address.port);
@@ -438,7 +444,8 @@ int send_message(NetworkAddress_t peer_address, int command,
   int clientfd = compsys_helper_open_clientfd(peer_ip, peer_port);
   if (clientfd < 0) {
       printf("Connection error, try again\n");
-      return -1;
+      status = -1;
+      return status;
   }
 
   // Create and populate request header
@@ -464,7 +471,8 @@ int send_message(NetworkAddress_t peer_address, int command,
       int n = compsys_helper_writen(clientfd, send_buffer, total_message_length);
       if (n < 0) {
       // TODO - proper error handling
-          printf("Error in sending for inform or file request\n");
+          printf("Error in sending inform or file request\n");
+          return -1;
       }
       bytes_send += n;
   }
@@ -472,11 +480,13 @@ int send_message(NetworkAddress_t peer_address, int command,
   // Handle response if relevant.
   // Command 3 is inform and doesn't expect response
   if (command != 3) {
-      handle_response(clientfd, command, request_body, request_len);
+      printf("passing on to handle_response\n");
+      status = handle_response(clientfd, command, request_body, request_len);
   }
   // close connection after response has been handled
+  // TODO - manage connection, so we can keep trying if we get a status error 5
   close(clientfd);
-  return 1;
+  return status;
 }
 
 
@@ -501,7 +511,7 @@ void send_error_message(char* error_message, int error_code, int connfd) {
             memcpy(message_buffer, message_buffer2, message_length);
             break;
         case 3:
-            printf("Peer trying to request file is not registered in network\n");
+            printf("Peer sending request is not registered in network\n");
             char* message_buffer3 = "Cannot fullfil request, peer not registered in network\0";
             message_length = strlen(message_buffer3);
             memcpy(message_buffer, message_buffer3, message_length);
@@ -545,8 +555,8 @@ void send_error_message(char* error_message, int error_code, int connfd) {
     memcpy(reply_header.block_hash, block_hash, SHA256_HASH_SIZE);
     memcpy(reply_header.total_hash, block_hash, SHA256_HASH_SIZE);
 
-
-    char outputbuffer[sizeof(ReplyHeader_t) + message_length];
+    int total_block_size = sizeof(ReplyHeader_t) + message_length;
+    char outputbuffer[total_block_size];
     memcpy(&outputbuffer[0], &reply_header.length, 4);
     memcpy(&outputbuffer[4], &reply_header.status, 4);
     memcpy(&outputbuffer[8], &reply_header.this_block, 4);
@@ -554,7 +564,8 @@ void send_error_message(char* error_message, int error_code, int connfd) {
     memcpy(&outputbuffer[16], &reply_header.block_hash, 32);
     memcpy(&outputbuffer[48], &reply_header.total_hash, 32);
     memcpy(&outputbuffer[80], message_buffer, message_length);
-    compsys_helper_writen(connfd, message_buffer, message_length);
+    compsys_helper_writen(connfd, outputbuffer, total_block_size);
+    printf("Error message sent error code %d\n", ntohl(reply_header.status));
 
 }
 
@@ -614,7 +625,15 @@ void* client_thread()
     char filename[chars_read];
     memcpy(filename, filename_buffer, chars_read);
     printf("Requesting file %s from %s:%d\n", filename, random_peer->ip, random_peer->port);
-    send_message(*random_peer, 2, filename, chars_read-1);
+    // Send file request message
+    int status = send_message(*random_peer, 2, filename, chars_read-1);
+    int identical_requests = 1;
+    while ((status == 0) && (identical_requests < 5)) {
+        printf("File unavailable, trying again at another peer.\n");
+        random_peer = return_random_peer();
+        status = send_message(*random_peer, 2, filename, chars_read-1);
+        identical_requests++;
+    }
   }    
   
   // You should never see this printed in your finished implementation
@@ -693,7 +712,6 @@ void send_response(uint32_t connfd, uint32_t status, char* response_body, int re
         // Allocate memory for all blocks in a buffer.
         // TODO - check for errors in allocation - this can
         // probably be done on stack.
-        //char block_buffer[number_of_blocks * MAX_MSG_LEN]; //+ size_of_last_block + sizeof(ReplyHeader_t));
         block_buffer = malloc(number_of_blocks * MAX_MSG_LEN);
 
         // Populate reply_header for first message.
@@ -933,9 +951,13 @@ void handle_file_request(RequestHeader_t* file_request_header, int connfd, char*
     // Allocate buffer for file content
     buffer = (char*) malloc(file_size + 1);
     // Check for error in allocation
+    // TODO - error handling, if buffer isn't allocated.
+    // Right now it just continues
     if (buffer == NULL) {
         perror("Error in allocation of buffer for file content\n");
+        send_error_message("Unknown error\n", 7, connfd);
         fclose(file);
+        return;
     }
 
     // Read file into buffer
@@ -1126,10 +1148,10 @@ void* handle_server_request(void* arg) {
             printf("Inform request body is the wrong length. It is: %d\n", request_body_length);
             send_error_message("", 7, request_connfd);
 
-        } else if (is_in_network(network, &requesting_peer, peer_count)) {
+        } else if (!is_in_network(network, &requesting_peer, peer_count)) {
           // if not registered, send error - even though it's just inform
-          send_error_message("Not registered in network.\0", 3, request_connfd);
-          printf("Peer requesting was not registered in network.\n");
+          send_error_message("Informing peer not registered in network.\0", 3, request_connfd);
+          /* printf("Peer requesting was not registered in network.\n"); */
 
         } else {
           handle_inform_message(&request_header, request_body);
