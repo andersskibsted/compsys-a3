@@ -1,5 +1,6 @@
 #include "common.h"
 #include "sha256.h"
+#include <ctype.h>
 #include <netinet/in.h>
 #include <pthread.h>
 #include <stdint.h>
@@ -37,12 +38,63 @@ uint32_t peer_count = 0;
 pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 int not_alone = 0;
 int active_threads = 0;
-int recent_identical_requests = 0;
-char recent_file_request[100];
+//int recent_identical_requests = 0;
+//char recent_file_request[100];
 
 typedef struct request_thread_args {
     int request_connfd;
 } request_thread_args_t;
+
+int is_safe_filename (const char* filename) {
+    // Check for safe filenames.
+    // Returns 1 if safe, 0 if not.
+    size_t max_length = 50;
+    size_t length = strlen(filename);
+    const char allowed_special_characters[] = {
+    '.', '-', '_', '\0'};
+    const char* dangerous_file_substrings[] = {
+    ".exe", ".EXE", ".bat", ".BAT", ".sh", ".SH",
+    "..", NULL
+};
+
+    // Check for null filename
+    if (!filename || length == 0) {
+        return 0;
+    }
+    // Check length
+    if (length > max_length) {
+        return 0;
+    }
+    // Hidden files/dot-files
+    if (filename[0] == '.') {
+        return 0;
+    }
+
+    for (size_t i = 0; i<length; i++) {
+        // Check if only allowed characters are used.
+        char c = filename[i];
+        int is_valid = isalnum(c);
+        for (int j = 0; allowed_special_characters[j] != '\0'; j++){
+            is_valid = is_valid || allowed_special_characters[j] == c;
+        }
+
+        if (!is_valid) {
+            printf("Char %c unsafe\n", c);
+            return 0;
+        }
+    }
+
+    for (size_t i = 0; dangerous_file_substrings[i] != NULL; i++) {
+        // Check if any of the dangerous extensions is embedded in filename,
+        // indicating malicious file.
+        if (strstr(filename, dangerous_file_substrings[i]) != NULL) {
+            return 0;
+        }
+    }
+
+    // Safe
+    return 1;
+}
 
 void print_salt(char* salt) {
      printf("Printing - Salt: ");
@@ -265,12 +317,19 @@ int handle_response(int clientfd, int request_command, char* request_body, int r
             int previous_peer_count = peer_count;
 
             int peers_added = 0;
+            pthread_mutex_lock(&lock);
             for (int i = 0; i < number_of_peers_in_response; i++) {
               NetworkAddress_t *peer = malloc(sizeof(NetworkAddress_t));
               make_network_addres_from_response(message_buf, peer, i * 68);
 
-              pthread_mutex_lock(&lock);
               if (!is_in_network(network, peer, previous_peer_count)) {
+                NetworkAddress_t** new_network = realloc(network, sizeof(NetworkAddress_t*) * (peer_count + 1));
+                if (new_network == NULL) {
+                    printf("Memory allocation error.\n");
+                } else {
+                    network = new_network;
+                }
+
                 int next_peer_place_in_network =
                     previous_peer_count + peers_added;
                 network[next_peer_place_in_network] = peer;
@@ -278,13 +337,13 @@ int handle_response(int clientfd, int request_command, char* request_body, int r
                 peers_added++;
               }
               not_alone = 1;
-              pthread_mutex_unlock(&lock);
             }
 
             printf("Number of peers in network: %d\n", peer_count);
             for (int i = 0; i < peer_count; i++) {
               print_network_address(network[i]);
             }
+            pthread_mutex_unlock(&lock);
 
             // If 2, it is a file request response
             // write buffer to disk
@@ -301,7 +360,7 @@ int handle_response(int clientfd, int request_command, char* request_body, int r
             // Create file and open it
             file = fopen(filename, "wb");
             if (file == NULL) {
-                perror("Error in trying to create file\n");
+                perror("Error in trying to create file.\n");
             }
 
             // First read message and check hashes
@@ -320,7 +379,10 @@ int handle_response(int clientfd, int request_command, char* request_body, int r
 
             // If just 1 block, write it to all to file
             if (reply_block_count == 1) {
-                fwrite(message_buf, 1, reply_length, file);
+                size_t bytes_written = fwrite(message_buf, 1, reply_length, file);
+                if (bytes_written != reply_length) {
+                    printf("Error writing incoming file to disk.\n");
+                }
                 fclose(file);
                 close(clientfd);
             } else {
@@ -627,7 +689,7 @@ void* client_thread()
     printf("Requesting file %s from %s:%d\n", filename, random_peer->ip, random_peer->port);
     // Send file request message
     int status = send_message(*random_peer, 2, filename, chars_read-1);
-    int identical_requests = 1;
+    int identical_requests = 0;
     while ((status == 0) && (identical_requests < 5)) {
         printf("File unavailable, trying again at another peer.\n");
         random_peer = return_random_peer();
@@ -711,8 +773,12 @@ void send_response(uint32_t connfd, uint32_t status, char* response_body, int re
 
         // Allocate memory for all blocks in a buffer.
         // TODO - check for errors in allocation - this can
-        // probably be done on stack.
+        // probably be done on stack. maybe return...
         block_buffer = malloc(number_of_blocks * MAX_MSG_LEN);
+        if (block_buffer == NULL) {
+            printf("Error in memory allocation while sending multisegment file.\n");
+            send_error_message("", 7, connfd);
+        }
 
         // Populate reply_header for first message.
         reply_header->block_count = htonl(number_of_blocks);
@@ -813,7 +879,9 @@ void send_response(uint32_t connfd, uint32_t status, char* response_body, int re
 void handle_inform_message(RequestHeader_t* inform_header, char* inform_body) {
     // inform_body must be 68 bytes!!
     // Check if message is from valid source
-    if (is_valid_ip(inform_header->ip) && is_valid_port(inform_header->port)) {
+
+    if (is_valid_ip(inform_header->ip)
+        && is_valid_port(inform_header->port)) {
         // Create new network address for network array
         NetworkAddress_t* new_peer = malloc(sizeof(NetworkAddress_t));
         memcpy(new_peer->ip, &inform_body[0], 16);
@@ -825,14 +893,37 @@ void handle_inform_message(RequestHeader_t* inform_header, char* inform_body) {
         memcpy(new_peer->signature, &inform_body[20], 32);
         memcpy(salt, &inform_body[52], 16);
         memcpy(new_peer->salt, salt, SALT_LEN);
-        network[peer_count] = new_peer;
-        peer_count++;
 
-        printf("Updating network on inform.\n Number of peers %d\n", peer_count);
-        for (int n = 0; n<peer_count; n++) {
-            print_network_address(network[n]);
+
+        pthread_mutex_lock(&lock);
+        if (!is_in_network(network, new_peer, peer_count)) {
+          NetworkAddress_t **new_network =
+              realloc(network, sizeof(NetworkAddress_t*) * (peer_count + 1));
+          if (new_network == NULL) {
+            printf("Memory allocation problem.\n");
+            free(new_peer);
+            return;
+          } else {
+            network = new_network;
+          }
+          printf("unlocked and ready to update network\n");
+
+          printf("updating\n");
+          network[peer_count] = new_peer;
+          printf("done\n");
+          peer_count++;
+          printf("incrementing\n");
+          printf("Updating network on inform.\n Number of peers %d\n",
+                 peer_count);
+        } else {
+          printf("Peer from inform request was already registered.\n");
         }
+        printf("about to print\n");
 
+        for (int n = 0; n < peer_count; n++) {
+          print_network_address(network[n]);
+        }
+        pthread_mutex_unlock(&lock);
     }
 }
 /*
@@ -844,30 +935,39 @@ void handle_register_message(RequestHeader_t* register_header, int connfd) {
     if (is_valid_ip(register_header->ip) && is_valid_port(register_header->port)) {
         // Create new network address for new peer
         NetworkAddress_t* new_peer = malloc(sizeof(NetworkAddress_t));
+        if (new_peer == NULL) {
+            printf("Memory allocation problem while registrering new peer.\n");
+            return;
+        }
         new_peer->port = register_header->port;
         memcpy(new_peer->ip, register_header->ip, 16);
 
         // Generate network saved signature with random salt
         char random_salt[SALT_LEN];
         generate_random_salt(random_salt);
-        // TODO - We can probably generate signature directly into NetworkAddress
-        /* hashdata_t* network_signature = (hashdata_t*) malloc(sizeof(hashdata_t)); */
 
         // Create network signature from register request signature and random salt.
-        // Now hardcoded to length 32, as that is what it is, but it probably
-        // should use a macro or constant.
         get_signature(register_header->signature, SHA256_HASH_SIZE, random_salt, &new_peer->signature);
         memcpy(new_peer->salt, random_salt, SALT_LEN);
-        /* memcpy(new_peer->signature, network_signature, SHA256_HASH_SIZE); */
-        /* free(network_signature); */
 
-        // Add to network and increment peer count
+        // Add to network and increment peer count and reallocate memory for network
+        pthread_mutex_lock(&lock);
+        NetworkAddress_t** new_network = realloc(network, sizeof(NetworkAddress_t*)*(peer_count + 1));
+        if (new_network == NULL) {
+            printf("Memory allocation problem while registrering.\n");
+            free(new_peer);
+            return;
+        } else {
+            network = new_network;
+        }
+
+        //memcpy(new_network, network, sizeof(NetworkAddress_t*)*peer_count);
+
         if (!is_in_network(network, new_peer, peer_count)) {
-            pthread_mutex_lock(&lock);
             network[peer_count] = new_peer;
             peer_count++;
-            pthread_mutex_unlock(&lock);
         }
+        pthread_mutex_unlock(&lock);
         // Print out result
         printf("Network updated after register message\n");
         for (int i = 0; i < peer_count; i++) {
@@ -934,6 +1034,13 @@ void handle_file_request(RequestHeader_t* file_request_header, int connfd, char*
     // Get name of file from request
     memcpy(filename, file_request_body, body_length);
     filename[body_length] = '\0';
+    // Check filename safety
+    if (!is_safe_filename(filename)) {
+        printf("Requested filename was unsafe!\n");
+        send_error_message("Unsafe file request, closing connection!\n", 7, connfd);
+        close(connfd);
+        return;
+    }
 
     // Open requested file
     file = fopen(filename, "r");
@@ -962,6 +1069,8 @@ void handle_file_request(RequestHeader_t* file_request_header, int connfd, char*
 
     // Read file into buffer
     bytes_read = fread(buffer, 1, file_size, file);
+    // TODO - det her er jo kun hvis det er en string.
+    // Og det null-byte sendes jo alligevel ikke.
     buffer[bytes_read] = '\0';
 
 
@@ -992,7 +1101,7 @@ void* handle_server_request(void* arg) {
     // Allocate memory for request header
     RequestHeader_t request_header;
     compsys_helper_state_t state;
-    char request_header_buffer[REQUEST_HEADER_LEN];// = malloc(REQUEST_HEADER_LEN);
+    char request_header_buffer[REQUEST_HEADER_LEN];
 
     // read request header and
     // TODO implement error handling
@@ -1049,12 +1158,20 @@ void* handle_server_request(void* arg) {
     if (request_command == 1) {
         // if there is no one in network, this must be the first peer
         // must be locked if there is a rapid influx of registrations to same peer
+        pthread_mutex_lock(&lock);
         if (peer_count == 0) {
-          pthread_mutex_lock(&lock);
 
           // Generate network saved signature of my signature
           // to be send out to the peers.
           printf("Assuming i'm the first peer\n");
+          NetworkAddress_t** new_network = realloc(network, sizeof(NetworkAddress_t*) * (peer_count + 1));
+          if (new_network == NULL) {
+              printf("Memory allocation problem.\n");
+              return NULL;
+          } else {
+              network = new_network;
+          }
+
           char random_salt[SALT_LEN + 1];
           generate_random_salt(random_salt);
           random_salt[SALT_LEN] = '\0';
@@ -1071,8 +1188,8 @@ void* handle_server_request(void* arg) {
           network[0] = my_self_in_network;
           peer_count++;
 
-          pthread_mutex_unlock(&lock);
         }
+        pthread_mutex_unlock(&lock);
 
         if (is_in_network(network, &requesting_peer, peer_count)) {
             // If registering peer already registered send error response and stop.
@@ -1093,15 +1210,13 @@ void* handle_server_request(void* arg) {
         }
       // Exit after handling the register message.
       // handle_register_message sends out a response
-      pthread_mutex_lock(&lock);
-      active_threads--;
-      pthread_mutex_unlock(&lock);
-      return NULL;
+
 
     } else if (request_command == 2) {
       // File request
       // Calculate hash of incoming signature
       hashdata_t incoming_signature_hash;
+      // TODO - free requesting_peer_info
       NetworkAddress_t *requesting_peer_info = malloc(sizeof(NetworkAddress_t));
       find_in_network(&requesting_peer, requesting_peer_info);
 
@@ -1134,16 +1249,22 @@ void* handle_server_request(void* arg) {
                request_port);
         handle_file_request(&request_header, request_connfd, request_body);
       }
-      // exit
-      pthread_mutex_lock(&lock);
-      active_threads--;
-      pthread_mutex_unlock(&lock);
-      return NULL;
+
+      free(requesting_peer_info);
 
     }   else if (request_command == 3) {
-      // Inform request
-      // If body is the wrong length, send error, else handle it
-      // by passing it on to function. After that exit.
+        // Inform request
+        // If body is the wrong length, send error, else handle it
+        // by passing it on to function. After that exit.
+        // Calculate hash of incoming signature
+        hashdata_t incoming_signature_hash;
+        // TODO - free requesting_peer_info
+        NetworkAddress_t *requesting_peer_info = malloc(sizeof(NetworkAddress_t));
+        find_in_network(&requesting_peer, requesting_peer_info);
+
+        get_signature(request_signature, SHA256_HASH_SIZE,
+                    requesting_peer_info->salt, &incoming_signature_hash);
+
         if ((request_body_length % 68) != 0) {
             printf("Inform request body is the wrong length. It is: %d\n", request_body_length);
             send_error_message("", 7, request_connfd);
@@ -1153,25 +1274,25 @@ void* handle_server_request(void* arg) {
           send_error_message("Informing peer not registered in network.\0", 3, request_connfd);
           /* printf("Peer requesting was not registered in network.\n"); */
 
+        } else if (memcmp(incoming_signature_hash, requesting_peer_info->signature, SHA256_HASH_SIZE) != 0) {
+            // Password mismatch
+            send_error_message("Password mismatch\0", 4, request_connfd);
         } else {
           handle_inform_message(&request_header, request_body);
         }
-
-        pthread_mutex_lock(&lock);
-        active_threads--;
-        pthread_mutex_unlock(&lock);
-        return NULL;
+        free(requesting_peer_info);
 
     } else {
 
       printf("Incoming request command wasn't understood\n");
       send_error_message("", 7, request_connfd);
 
-      pthread_mutex_lock(&lock);
-      active_threads--;
-      pthread_mutex_unlock(&lock);
-      return NULL;
     }
+
+    pthread_mutex_lock(&lock);
+    active_threads--;
+    pthread_mutex_unlock(&lock);
+    return NULL;
 }
 
 
@@ -1185,9 +1306,11 @@ void* server_thread() {
   // Incoming connection threads
   // TODO - find a way to just allocate memory when needed.
   //pthread_t* connection_threads = malloc(sizeof(pthread_t) * 15);
+  // Maybe I do not need to save pointer to thread, or store in array,
+  // since they detach...
   // Maybe this is ok, since server thread will never finish, unless
   // we exit program. And we call detach(self) in threads
-  int max_requests = 25;
+  int max_requests = 10;
   pthread_t connection_threads[max_requests];
   struct sockaddr_storage clientaddr;
   struct sockaddr_in listen_address;
@@ -1204,10 +1327,10 @@ void* server_thread() {
           }
         request_thread_args_t* arg = malloc(sizeof(request_thread_args_t));
         arg->request_connfd = connfd;
-        pthread_mutex_lock(&lock);
         pthread_create(&connection_threads[active_threads], NULL, handle_server_request, (void*)arg);
         // thread copies and frees its arg, so no free needed here.
 
+        pthread_mutex_lock(&lock);
         active_threads++;
         pthread_mutex_unlock(&lock);
       }
@@ -1264,7 +1387,9 @@ int main(int argc, char **argv)
 
     // Most correctly, we should randomly generate our salts, but this can make
     // repeated testing difficult so feel free to use the hard coded salt below
-    char salt[SALT_LEN+1] = "0123456789ABCDEF\0";
+    //char salt[SALT_LEN+1] = "0123456789ABCDEF\0";
+    char salt[SALT_LEN];
+    generate_random_salt(salt);
     // Ved registrering:
     memcpy(my_address->salt, salt, SALT_LEN);
 
@@ -1273,7 +1398,11 @@ int main(int argc, char **argv)
     get_signature(password, strlen(password), salt, &signature);
 
     // Now hardcoded to 50 but there is probably an elegant way to do it
-    network = malloc(sizeof(NetworkAddress_t*) * 50);
+    network = malloc(sizeof(NetworkAddress_t*));
+    if (network == NULL) {
+        printf("Memory allocation problem on startup.\n");
+        return -1;
+    }
     memcpy(my_address->signature, signature, SHA256_HASH_SIZE);
 
     // Setup the client and server threads
