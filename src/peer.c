@@ -564,7 +564,6 @@ int send_message(NetworkAddress_t peer_address, int command,
     // Handle response if relevant.
     // Command 3 is inform and doesn't expect response
     if (command != 3) {
-        printf("passing on to handle_response\n");
         status = handle_response(clientfd, command, request_body, request_len);
     }
     // close connection after response has been handled
@@ -926,7 +925,6 @@ void handle_inform_message(RequestHeader_t* inform_header, char* inform_body) {
         } else {
           printf("Peer from inform request was already registered.\n");
         }
-        printf("about to print\n");
 
         for (int n = 0; n < peer_count; n++) {
           print_network_address(network[n]);
@@ -937,7 +935,6 @@ void handle_inform_message(RequestHeader_t* inform_header, char* inform_body) {
 
 
 void handle_register_message(RequestHeader_t* register_header, int connfd) {
-    printf("Handling register message\n");
 
     if (is_valid_ip(register_header->ip) && is_valid_port(register_header->port)) {
         // Create new network address for new peer
@@ -958,9 +955,7 @@ void handle_register_message(RequestHeader_t* register_header, int connfd) {
         memcpy(new_peer->salt, random_salt, SALT_LEN);
 
         // Add to network and increment peer count and reallocate memory for network
-        printf("about to lock in handle_register\n");
         pthread_mutex_lock(&lock);
-        printf("locked and proceeding\n");
         NetworkAddress_t** new_network = realloc(network, sizeof(NetworkAddress_t*)*(peer_count + 1));
         if (new_network == NULL) {
             printf("Memory allocation problem while registrering.\n");
@@ -1183,10 +1178,8 @@ void* handle_server_request(void* arg) {
           peer_count++;
           not_alone = 1;
 
-          printf("first peer about to unlock\n");
         pthread_mutex_unlock(&lock);
         }
-        printf("after first peer unlocking\n");
         // is_in_network needs to be locked
         pthread_mutex_lock(&lock);
         int requesting_peer_is_in_network = is_in_network(network, &requesting_peer, peer_count);
