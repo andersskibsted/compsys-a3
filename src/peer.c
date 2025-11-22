@@ -577,8 +577,6 @@ int send_message(NetworkAddress_t peer_address, int command,
 void send_error_message(char* error_message, int error_code, int connfd) {
     // Sends out an error message depending on the error code,
     // and prints appropriate message.
-    // TODO - message_buffer to be allocated in the size needed,
-    // depending on message.
 
     char* message_buffer[255];
     int message_length = 0;
@@ -765,13 +763,10 @@ void send_response(uint32_t connfd, uint32_t status, char* response_body, int re
         // Assemble message to be send as response
         size_t total_response_length = sizeof(ReplyHeader_t) + response_length;
         char *outputbuffer = malloc(total_response_length);
-        // TODO - copy fields into outputbuffer, not entire struct
         memcpy(&outputbuffer[0], reply_header, sizeof(ReplyHeader_t));
         memcpy(&outputbuffer[sizeof(ReplyHeader_t)], response_body,
                response_length);
 
-        // TODO - implement while loop to make sure all is written
-        // as compsys_helper might be non blocking
         size_t bytes_send = 0;
         size_t n = 0;
         while (bytes_send < total_response_length) {
@@ -949,7 +944,7 @@ void handle_register_message(RequestHeader_t* register_header, int connfd) {
         if (new_peer == NULL) {
             printf("Memory allocation problem while registrering new peer.\n");
             return;
-        }
+
         new_peer->port = register_header->port;
         memcpy(new_peer->ip, register_header->ip, 16);
 
