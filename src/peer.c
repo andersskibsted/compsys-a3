@@ -703,8 +703,9 @@ void* client_thread()
             print_network_address(network[i]);
             }
         }
-
+        pthread_mutex_lock(&lock);
         NetworkAddress_t* random_peer = return_random_peer();
+        pthread_mutex_unlock(&lock);
         char filename[chars_read];
         memcpy(filename, filename_buffer, chars_read);
         printf("Requesting file %s from %s:%d\n", filename, random_peer->ip, random_peer->port);
@@ -1300,12 +1301,6 @@ void* server_thread() {
   int listenfd;
 
   // Incoming connection threads
-  // TODO - find a way to just allocate memory when needed.
-  //pthread_t* connection_threads = malloc(sizeof(pthread_t) * 15);
-  // Maybe I do not need to save pointer to thread, or store in array,
-  // since they detach...
-  // Maybe this is ok, since server thread will never finish, unless
-  // we exit program. And we call detach(self) in threads
   int max_requests = 10;
   pthread_t connection_threads[max_requests];
   struct sockaddr_storage clientaddr;
@@ -1383,7 +1378,6 @@ int main(int argc, char **argv)
 
     // Most correctly, we should randomly generate our salts, but this can make
     // repeated testing difficult so feel free to use the hard coded salt below
-    //char salt[SALT_LEN+1] = "0123456789ABCDEF\0";
     char salt[SALT_LEN];
     generate_random_salt(salt);
     // Ved registrering:
@@ -1393,7 +1387,6 @@ int main(int argc, char **argv)
     hashdata_t signature;
     get_signature(password, strlen(password), salt, &signature);
 
-    // Now hardcoded to 50 but there is probably an elegant way to do it
     network = malloc(sizeof(NetworkAddress_t*));
     if (network == NULL) {
         printf("Memory allocation problem on startup.\n");
