@@ -10,6 +10,7 @@
 #include <netdb.h>
 #include <sys/_endian.h>
 #include <sys/_pthread/_pthread_attr_t.h>
+#include <sys/_pthread/_pthread_cond_t.h>
 #include <sys/_pthread/_pthread_mutex_t.h>
 #include <sys/_pthread/_pthread_t.h>
 #include <sys/_types/_size_t.h>
@@ -35,11 +36,13 @@ NetworkAddress_t *my_address;
 
 NetworkAddress_t** network = NULL;
 uint32_t peer_count = 0;
+
 pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t cond = PTHREAD_COND_INITIALIZER;
+
 int not_alone = 0;
 int active_threads = 0;
-//int recent_identical_requests = 0;
-//char recent_file_request[100];
+int is_registered = 0;
 
 typedef struct request_thread_args {
     int request_connfd;
@@ -317,7 +320,9 @@ int handle_response(int clientfd, int request_command, char* request_body, int r
             int previous_peer_count = peer_count;
 
             int peers_added = 0;
+
             pthread_mutex_lock(&lock);
+
             for (int i = 0; i < number_of_peers_in_response; i++) {
               NetworkAddress_t *peer = malloc(sizeof(NetworkAddress_t));
               make_network_addres_from_response(message_buf, peer, i * 68);
@@ -338,11 +343,13 @@ int handle_response(int clientfd, int request_command, char* request_body, int r
               }
               not_alone = 1;
             }
-
+            is_registered = 1;
             printf("Number of peers in network: %d\n", peer_count);
             for (int i = 0; i < peer_count; i++) {
               print_network_address(network[i]);
             }
+
+            pthread_cond_broadcast(&cond);
             pthread_mutex_unlock(&lock);
 
             // If 2, it is a file request response
@@ -683,6 +690,11 @@ void* client_thread()
     if (strcmp(filename_buffer, "quit") == 0) {
         break;
     }
+    if (strcmp(filename_buffer, "print") == 0) {
+        for (int i = 0; i<peer_count; i++) {
+        print_network_address(network[i]);
+        }
+    }
     NetworkAddress_t* random_peer = return_random_peer();
     char filename[chars_read];
     memcpy(filename, filename_buffer, chars_read);
@@ -896,6 +908,10 @@ void handle_inform_message(RequestHeader_t* inform_header, char* inform_body) {
 
 
         pthread_mutex_lock(&lock);
+        while (!is_registered && !not_alone) {
+
+            pthread_cond_wait(&cond, &lock);
+        }
         if (!is_in_network(network, new_peer, peer_count)) {
           NetworkAddress_t **new_network =
               realloc(network, sizeof(NetworkAddress_t*) * (peer_count + 1));
@@ -951,7 +967,12 @@ void handle_register_message(RequestHeader_t* register_header, int connfd) {
         memcpy(new_peer->salt, random_salt, SALT_LEN);
 
         // Add to network and increment peer count and reallocate memory for network
+        printf("Just before handler lock\n");
         pthread_mutex_lock(&lock);
+        printf("Just after handler lock\n");
+        /* while (!is_registered || not_alone) { */
+        /*     pthread_cond_wait(&cond, &lock); */
+        /* } */
         NetworkAddress_t** new_network = realloc(network, sizeof(NetworkAddress_t*)*(peer_count + 1));
         if (new_network == NULL) {
             printf("Memory allocation problem while registrering.\n");
@@ -967,7 +988,6 @@ void handle_register_message(RequestHeader_t* register_header, int connfd) {
             network[peer_count] = new_peer;
             peer_count++;
         }
-        pthread_mutex_unlock(&lock);
         // Print out result
         printf("Network updated after register message\n");
         for (int i = 0; i < peer_count; i++) {
@@ -1015,6 +1035,7 @@ void handle_register_message(RequestHeader_t* register_header, int connfd) {
               send_message(*network[peer], 3, inform_body, sizeof(NetworkAddress_t));
             }
         }
+        pthread_mutex_unlock(&lock);
         // Do not free new_peer as it is to be saved as a pointer
         // in network array. Should be freed on teardown.
     }
@@ -1158,15 +1179,16 @@ void* handle_server_request(void* arg) {
     if (request_command == 1) {
         // if there is no one in network, this must be the first peer
         // must be locked if there is a rapid influx of registrations to same peer
-        pthread_mutex_lock(&lock);
         if (peer_count == 0) {
 
+        pthread_mutex_lock(&lock);
           // Generate network saved signature of my signature
           // to be send out to the peers.
           printf("Assuming i'm the first peer\n");
           NetworkAddress_t** new_network = realloc(network, sizeof(NetworkAddress_t*) * (peer_count + 1));
           if (new_network == NULL) {
               printf("Memory allocation problem.\n");
+              pthread_mutex_unlock(&lock);
               return NULL;
           } else {
               network = new_network;
@@ -1187,9 +1209,11 @@ void* handle_server_request(void* arg) {
                  SHA256_HASH_SIZE);
           network[0] = my_self_in_network;
           peer_count++;
+          not_alone = 1;
 
-        }
         pthread_mutex_unlock(&lock);
+        printf("First peer done\n");
+        }
 
         if (is_in_network(network, &requesting_peer, peer_count)) {
             // If registering peer already registered send error response and stop.
@@ -1206,6 +1230,7 @@ void* handle_server_request(void* arg) {
           if (request_body_length != 0) {
             printf("body contains message - which it shouldn't\n");
           }
+          printf("passing on to handler\n");
           handle_register_message(&request_header, request_connfd);
         }
       // Exit after handling the register message.
