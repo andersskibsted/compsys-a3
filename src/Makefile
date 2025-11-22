@@ -2,7 +2,7 @@
 GCC=gcc -g -Wall -Wextra -pedantic -std=gnu11
 LD_FLAGS= -lpthread -lm
 
-all: peer hasher
+all: peer
 
 rebuild: clean all
 

@@ -937,6 +937,7 @@ void handle_inform_message(RequestHeader_t* inform_header, char* inform_body) {
 
 
 void handle_register_message(RequestHeader_t* register_header, int connfd) {
+    printf("Handling register message\n");
 
     if (is_valid_ip(register_header->ip) && is_valid_port(register_header->port)) {
         // Create new network address for new peer
@@ -944,7 +945,7 @@ void handle_register_message(RequestHeader_t* register_header, int connfd) {
         if (new_peer == NULL) {
             printf("Memory allocation problem while registrering new peer.\n");
             return;
-
+        }
         new_peer->port = register_header->port;
         memcpy(new_peer->ip, register_header->ip, 16);
 
@@ -957,8 +958,9 @@ void handle_register_message(RequestHeader_t* register_header, int connfd) {
         memcpy(new_peer->salt, random_salt, SALT_LEN);
 
         // Add to network and increment peer count and reallocate memory for network
+        printf("about to lock in handle_register\n");
         pthread_mutex_lock(&lock);
-
+        printf("locked and proceeding\n");
         NetworkAddress_t** new_network = realloc(network, sizeof(NetworkAddress_t*)*(peer_count + 1));
         if (new_network == NULL) {
             printf("Memory allocation problem while registrering.\n");
@@ -1024,6 +1026,7 @@ void handle_register_message(RequestHeader_t* register_header, int connfd) {
         // in network array. Should be freed on teardown.
     }
 }
+
 
 void handle_file_request(RequestHeader_t* file_request_header, int connfd, char* file_request_body) {
 
@@ -1180,12 +1183,15 @@ void* handle_server_request(void* arg) {
           peer_count++;
           not_alone = 1;
 
+          printf("first peer about to unlock\n");
         pthread_mutex_unlock(&lock);
         }
+        printf("after first peer unlocking\n");
         // is_in_network needs to be locked
         pthread_mutex_lock(&lock);
         int requesting_peer_is_in_network = is_in_network(network, &requesting_peer, peer_count);
         pthread_mutex_unlock(&lock);
+        printf("after is_in_network\n");
 
         if (requesting_peer_is_in_network) {
             // If registering peer already registered send error response and stop.
@@ -1334,8 +1340,7 @@ void free_addresses_in_network() {
     free(network);
 }
 
-int main(int argc, char **argv)
-{
+int main(int argc, char **argv) {
     // Users should call this script with a single argument describing what 
     // config to use
     if (argc != 3)
@@ -1375,7 +1380,6 @@ int main(int argc, char **argv)
     // repeated testing difficult so feel free to use the hard coded salt below
     char salt[SALT_LEN];
     generate_random_salt(salt);
-    // Ved registrering:
     memcpy(my_address->salt, salt, SALT_LEN);
 
     // Create a signature from password and salt, and store in signature    
