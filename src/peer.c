@@ -155,21 +155,16 @@ void print_network_address(NetworkAddress_t* address) {
     printf("In network: %s:%d\n", address->ip, address->port);
 }
 
-// TODO - Should it do something to data in place, so it is more obvious who
-// allocates the memory? Just remember to free network[] when done this way
-//
 void make_network_addres_from_response(void *data, NetworkAddress_t* new_peer, int offset) {
   // Parse data read in from response to a register request.
   // offset is because it is used in a loop, so it reads from entire message
   // body, and only reads info of one peer
 
-  //NetworkAddress_t* new_peer = malloc(sizeof(NetworkAddress_t));
   memcpy(new_peer->ip, &data[offset], 16);
   new_peer->port = ntohl(*(uint32_t *)&data[offset + 16]);
   memcpy(new_peer->signature, &data[offset + 20], 32);
   memcpy(new_peer->salt, &data[offset + 52], 16);
 
-  //return new_peer;
 }
 
 int is_in_network(NetworkAddress_t **network, NetworkAddress_t* peer, int number_of_peers) {
@@ -198,16 +193,17 @@ int find_in_network(NetworkAddress_t* peer_to_match, NetworkAddress_t* new_peer_
     // Looks up and finds peer in network returning network address
     // with signature and salt.
     // returns 1 if found, 0 if not.
+    int exit_status = 0;
     if (is_in_network(network, peer_to_match, peer_count)) {
         for (int i = 0; i<peer_count; i++) {
             if (is_same_peer(peer_to_match, network[i])) {
                 memcpy(new_peer_location, network[i], sizeof(NetworkAddress_t));
-                return 1;
+                exit_status = 1;
             }
         }
     }
-    // return 0 if non found.
-    return 0;
+    // return status 0.
+    return exit_status;
 }
 
 
@@ -227,8 +223,6 @@ int is_same_ip_and_port(char* ip1, int port1, char* ip2, int port2) {
 NetworkAddress_t* return_random_peer() {
     // Returns a random peer from the network array of stored peers.
     // Does not return it self
-    // TODO - make sure it works now that my address and network[0] are
-    // kinda the same
     uint32_t random_peer_number = rand() % peer_count;
     if (is_same_peer(network[random_peer_number], my_address)) {
             random_peer_number = (random_peer_number + 1) % peer_count;
@@ -239,263 +233,285 @@ NetworkAddress_t* return_random_peer() {
 int handle_response(int clientfd, int request_command, char* request_body, int request_len) {
 
   // Handling the response
-  // For now this takes care of all three kinds of requests
+  // This takes care of all three kinds of requests
   // 1 registration, 2 file request, 3 doesn't get a response
-  // for a 2 it needs original request message and length to get filename for file to be
+  // For 2 it needs original request message and length to get filename for file to be
   // recieved.
-  // TODO change reply_header from char array to ReplyHeader_t struct
-  // TODO - don't user header structs but just variables with proper names
-  // TODO - handle file not found error status
 
   char buf[MAX_MSG_LEN];
   char reply_header[REPLY_HEADER_LEN];
   compsys_helper_state_t state;
   int max_body_length = MAX_MSG_LEN - sizeof(ReplyHeader_t);
 
-  // init clientfd to recieve message from peer
   compsys_helper_readinitb(&state, clientfd);
-  size_t n;
-  //
+  size_t n = 0;
+
   // If bytes being read, enter message parsing
-  printf("Just before reading response header\n");
-  if ((n = compsys_helper_readnb(&state, reply_header, REPLY_HEADER_LEN)) > 0) {
-      printf("read %zu bytes\n", n);
-    uint32_t reply_length = ntohl(*(uint32_t *)&reply_header[0]);
+  size_t bytes_read = 0;
+  while (bytes_read < REPLY_HEADER_LEN) {
 
-    // Check reply code for erros
-    uint32_t reply_status = ntohl(*(uint32_t *)&reply_header[4]);
-    printf("Reply status %d\n", reply_status);
+      if ((n = compsys_helper_readnb(&state, reply_header, REPLY_HEADER_LEN)) < 0) {
+        printf("Error while recieving response.\n");
+        return -1;
+      }
+      bytes_read += n;
+  }
 
-    // Reply status contains errors
-    if (reply_status > 1) {
-      printf("Error status code from peer %d\n", reply_status);
-      switch (reply_status) {
-          case 2:
-              // Only for peer registration responses
-              printf("Peer already exists\n");
-              break;
-          case 3:
-              printf("Peer is missing in network we requested from, hasn't registered yet\n");
-              break;
-          case 4:
-              printf("Password mismatch\n");
-              break;
-        case 5:
-              printf("Peer to busy to handle request or file didn't exist, trying again\n");
-              return 0;
-              break;
-        case 6:
-              printf("Unknow error occured at peer.\n");
-              break;
-        case 7:
-              printf("Request was malformed, please try again.\n");
-          default:
-              break;
-              }
-    } else {
-        // if reply code was 1, continue parsing the header and message
+  printf("Read %zu bytes of response\n", n);
+  uint32_t reply_length = ntohl(*(uint32_t *)&reply_header[0]);
 
-        // Parsing reply block header into variables and then into fields
-        uint32_t reply_block_number = ntohl(*(uint32_t *)&reply_header[8]);
-        uint32_t reply_block_count = ntohl(*(uint32_t *)&reply_header[12]);
-        char reply_block_hash[32];
-        memcpy(reply_block_hash, &reply_header[16], 32);
-        char reply_block_total_hash[32];
-        memcpy(reply_block_total_hash, &reply_header[48], 32);
+  // Check reply code for erros
+  uint32_t reply_status = ntohl(*(uint32_t *)&reply_header[4]);
+  printf("Reply status %d\n", reply_status);
 
-        if (request_command == 1) {
-            // If 1, read and parse reply message and put new peers in network
-            char message_buf[reply_length];
-            size_t bytes_received = compsys_helper_readnb(&state, message_buf, reply_length);
+  // Reply status contains errors
+  if (reply_status > 1) {
+    printf("Error status code from peer %d\n", reply_status);
+    switch (reply_status) {
+    case 2:
+      // Only for peer registration responses
+      printf("Peer already exists\n");
+      break;
+    case 3:
+      printf("Peer is missing in network we requested from, hasn't registered "
+             "yet\n");
+      break;
+    case 4:
+      printf("Password mismatch\n");
+      break;
+    case 5:
+      printf("Peer to busy to handle request or file didn't exist, trying "
+             "again\n");
+      return 0;
+      break;
+    case 6:
+      printf("Unknow error occured at peer.\n");
+      break;
+    case 7:
+      printf("Request was malformed, please try again.\n");
+    default:
+      break;
+    }
+  } else {
+    // if reply code was 1, continue parsing the header and message
 
-            // check if message hash is identical to hash from header
-            // TODO - hash mismatch should have consequences
-            char message_hash[32];
-            get_data_sha(message_buf, message_hash, reply_length, 32);
-            if (memcmp(message_hash, reply_block_hash, 32) != 0) {
-              printf("Hashes not identical, something is in response handling\n");
-            }
+    // Parsing reply block header into variables and then into fields
+    uint32_t reply_block_number = ntohl(*(uint32_t *)&reply_header[8]);
+    uint32_t reply_block_count = ntohl(*(uint32_t *)&reply_header[12]);
+    char reply_block_hash[32];
+    memcpy(reply_block_hash, &reply_header[16], 32);
+    char reply_block_total_hash[32];
+    memcpy(reply_block_total_hash, &reply_header[48], 32);
 
-            int number_of_peers_in_response = reply_length / 68;
-            int previous_peer_count = peer_count;
+    if (request_command == 1) {
+      // If 1, original request was registration,
+      // read and parse reply message and put new peers in network
+      char message_buf[reply_length];
+      size_t bytes_received =
+          compsys_helper_readnb(&state, message_buf, reply_length);
 
-            int peers_added = 0;
+      // check if message hash is identical to hash from header
+      char message_hash[32];
+      get_data_sha(message_buf, message_hash, reply_length, 32);
+      if (memcmp(message_hash, reply_block_hash, 32) != 0) {
 
-            pthread_mutex_lock(&lock);
+        printf("Hash of data not identical to header hash.\n");
+        printf("Data might be corrupted, please try registering again.\n");
+        close(clientfd);
+        return -1;
+      }
 
-            for (int i = 0; i < number_of_peers_in_response; i++) {
-              NetworkAddress_t *peer = malloc(sizeof(NetworkAddress_t));
-              make_network_addres_from_response(message_buf, peer, i * 68);
+      int number_of_peers_in_response = reply_length / 68;
+      int previous_peer_count = peer_count;
 
-              if (!is_in_network(network, peer, previous_peer_count)) {
-                NetworkAddress_t** new_network = realloc(network, sizeof(NetworkAddress_t*) * (peer_count + 1));
-                if (new_network == NULL) {
-                    printf("Memory allocation error.\n");
-                } else {
-                    network = new_network;
-                }
+      int peers_added = 0;
 
-                int next_peer_place_in_network =
-                    previous_peer_count + peers_added;
-                network[next_peer_place_in_network] = peer;
-                peer_count++;
-                peers_added++;
-              }
-              not_alone = 1;
-            }
-            is_registered = 1;
-            printf("Number of peers in network: %d\n", peer_count);
-            for (int i = 0; i < peer_count; i++) {
-              print_network_address(network[i]);
-            }
+      pthread_mutex_lock(&lock);
 
-            pthread_cond_broadcast(&cond);
-            pthread_mutex_unlock(&lock);
+      for (int i = 0; i < number_of_peers_in_response; i++) {
+        NetworkAddress_t *peer = malloc(sizeof(NetworkAddress_t));
+        make_network_addres_from_response(message_buf, peer, i * 68);
 
-            // If 2, it is a file request response
-            // write buffer to disk
-        } else if (request_command == 2) {
+        if (!is_in_network(network, peer, previous_peer_count)) {
+          NetworkAddress_t **new_network =
+              realloc(network, sizeof(NetworkAddress_t *) * (peer_count + 1));
+          if (new_network == NULL) {
+            printf("Memory allocation error.\n");
+          } else {
+            network = new_network;
+          }
 
-            // Prepare file to be written
-            FILE *file;
-
-            // Get filename from request message, and terminate with '\0'
-            char filename[request_len + 1];
-            memcpy(filename, request_body, request_len);
-            filename[request_len] = '\0';
-
-            // Create file and open it
-            file = fopen(filename, "wb");
-            if (file == NULL) {
-                perror("Error in trying to create file.\n");
-            }
-
-            // First read message and check hashes
-            char message_buf[reply_length];
-            size_t bytes_received =
-                compsys_helper_readnb(&state, message_buf, reply_length);
-
-            // check if message hash is identical to hash from header
-            // TODO - mismatch should have consequenses
-            char message_hash[32];
-            get_data_sha(message_buf, message_hash, reply_length, 32);
-            if (memcmp(message_hash, reply_block_hash, 32) != 0) {
-                printf("Hashes not identical, something is wrong\n");
-            }
-
-
-            // If just 1 block, write it to all to file
-            if (reply_block_count == 1) {
-                size_t bytes_written = fwrite(message_buf, 1, reply_length, file);
-                if (bytes_written != reply_length) {
-                    printf("Error writing incoming file to disk.\n");
-                }
-                fclose(file);
-                close(clientfd);
-            } else {
-                // if more blocks, set up values for book keeping.
-                // We already recieved response header in the beginning.
-                int blocks_recieved = 1;
-                int total_blocks = reply_block_count;
-                //int data_recieved = 0;
-                int file_data_recieved = max_body_length;
-                int bytes_read = 0;
-
-                int potential_data_to_be_recieved = total_blocks * MAX_MSG_LEN;
-                char file_buffer[potential_data_to_be_recieved];
-                int current_block = reply_block_number;
-
-                // Copy first read message into buffer, so we're ready for
-                // the while loop
-                memcpy(&file_buffer[(current_block)*max_body_length], message_buf, max_body_length);
-                // loop until all blocks have been recieved
-                // TODO - check hashes in while loop
-                // Block numbering is 0 indexed
-                while (blocks_recieved < total_blocks) {
-
-                    // Read next header
-                    //ReplyHeader_t* reply_header_while = malloc(sizeof(ReplyHeader_t));
-                    char reply_header_buffer[80];
-                    int total_read = 0;
-                    // This is the way it's done in robust_server.c from lecture code
-                    while (total_read < 80) {
-                        bytes_read = compsys_helper_readnb(&state, reply_header_buffer, sizeof(ReplyHeader_t));
-                        if (bytes_read <= 0) {
-                            printf("Receiving header segment of multi block file failed\n");
-                            printf("Read %d bytes\n", bytes_read);
-                            break;
-                        }
-                        total_read += bytes_read;
-                    }
-                     // Parsing reply block header into variables
-                    uint32_t body_length = ntohl(*(uint32_t*)&reply_header_buffer[0]);
-                    //uint32_t status = ntohl(*(uint32_t*)&reply_header_buffer[4]);
-                    current_block = ntohl(*(uint32_t *)&reply_header_buffer[8]);
-                    total_blocks = ntohl(*(uint32_t *)&reply_header_buffer[12]);
-                    char block_hash[32];
-                    memcpy(block_hash, &reply_header_buffer[16], 32);
-                    char total_hash[32];
-                    memcpy(total_hash, &reply_header_buffer[48], 32);
-
-                    //data_recieved += bytes_read;
-
-                    // Read message body for current block
-                    char message_body_buffer[body_length];
-                    int total_body_read = 0;
-                    while (total_body_read < body_length) {
-
-                        bytes_read = compsys_helper_readnb(
-                            &state, message_body_buffer, body_length);
-                        total_body_read += bytes_read;
-                    }
-
-                    // Check the hash of this part of the message
-                    hashdata_t message_hash;
-                    get_data_sha(message_body_buffer, message_hash, body_length, SHA256_HASH_SIZE);
-                    if (memcmp(message_hash, block_hash, SHA256_HASH_SIZE) != 0) {
-                        // TODO - should be error handled
-                       printf("Hashes of message body of block %d / %d did not match\n", current_block, total_blocks);
-                    }
-
-                    if (bytes_read <= 0) {
-                        // maybe should have consequenses
-                        printf("Recieving body segment of multi block file "
-                               "failed\n");
-                        break;
-                    }
-
-                    blocks_recieved++;
-                    //data_recieved += bytes_read;
-                    // To keep track of the final file size
-                    // Maybe there is a more robust way
-                    file_data_recieved += bytes_read;
-
-                    // Copy to message buffer to file buffer
-                    memcpy(&file_buffer[(current_block) * max_body_length],
-                           message_body_buffer, body_length);
-                    printf("Read and copied block %d\n", current_block);
-
-                }
-
-                // Check total message hash with total hash
-                hashdata_t total_message_hash;
-                get_data_sha(file_buffer, total_message_hash, file_data_recieved, SHA256_HASH_SIZE);
-                if (memcmp(total_message_hash, reply_block_total_hash, SHA256_HASH_SIZE) != 0) {
-                    // TODO - implement error handling
-                    printf("The hash of the total message and the provided total hash didn't match\n");
-                } else {
-                    // Write file buffer to file if hashes match
-                    fwrite(file_buffer, 1, file_data_recieved, file);
-                }
-                // Delete file if not ok?
-                fclose(file);
-                close(clientfd);
-                // Free memory
-                // TODO ?
-            }
+          int next_peer_place_in_network = previous_peer_count + peers_added;
+          network[next_peer_place_in_network] = peer;
+          peer_count++;
+          peers_added++;
         }
+        not_alone = 1;
+      }
+      is_registered = 1;
+      printf("Number of peers in network: %d\n", peer_count);
+      for (int i = 0; i < peer_count; i++) {
+        print_network_address(network[i]);
+      }
+      // Broadcast to all waiting inform request threads
+      // that registration is done, and they are allowed to work.
+      pthread_cond_broadcast(&cond);
+      pthread_mutex_unlock(&lock);
+
+      // If 2, it is a file request response
+      // write buffer to disk
+    } else if (request_command == 2) {
+
+      // Prepare file to be written
+      FILE *file;
+
+      // Get filename from request message, and terminate with '\0'
+      char filename[request_len + 1];
+      memcpy(filename, request_body, request_len);
+      filename[request_len] = '\0';
+
+      // Create file and open it
+      file = fopen(filename, "wb");
+      if (file == NULL) {
+        perror("Error in trying to create file.\n");
+        close(clientfd);
+        return -1;
+      }
+
+      // First read message and check hashes
+      char message_buf[reply_length];
+      size_t bytes_received =
+          compsys_helper_readnb(&state, message_buf, reply_length);
+
+      // check if message hash is identical to hash from header
+      char message_hash[32];
+      get_data_sha(message_buf, message_hash, reply_length, 32);
+      if (memcmp(message_hash, reply_block_hash, 32) != 0) {
+        printf("Hashes not identical, something is wrong\n");
+        close(clientfd);
+        return -1;
+      }
+
+      // If just 1 block, write it to all to file
+      if (reply_block_count == 1) {
+        size_t bytes_written = fwrite(message_buf, 1, reply_length, file);
+        if (bytes_written != reply_length) {
+          printf("Error writing incoming file to disk.\n");
+          fclose(file);
+          close(clientfd);
+          return -1;
+        }
+        fclose(file);
+        close(clientfd);
+      } else {
+        // if more blocks, set up values for book keeping.
+        // We already recieved response header in the beginning.
+        int blocks_recieved = 1;
+        int total_blocks = reply_block_count;
+        int file_data_recieved = max_body_length;
+        int bytes_read = 0;
+
+        int potential_data_to_be_recieved = total_blocks * MAX_MSG_LEN;
+        char file_buffer[potential_data_to_be_recieved];
+        int current_block = reply_block_number;
+
+        // Copy first read message into buffer, so we're ready for
+        // the while loop
+        memcpy(&file_buffer[(current_block)*max_body_length], message_buf,
+               max_body_length);
+        // loop until all blocks have been recieved
+        // Block numbering is 0 indexed
+        while (blocks_recieved < total_blocks) {
+
+          // Read next header
+          // ReplyHeader_t* reply_header_while = malloc(sizeof(ReplyHeader_t));
+          char reply_header_buffer[80];
+          int total_read = 0;
+          // This is the way it's done in robust_server.c from lecture code
+          while (total_read < 80) {
+            bytes_read = compsys_helper_readnb(&state, reply_header_buffer,
+                                               sizeof(ReplyHeader_t));
+            if (bytes_read <= 0) {
+              printf("Receiving header segment of multi block file failed\n");
+              printf("Read %d bytes\n", bytes_read);
+              break;
+            }
+            total_read += bytes_read;
+          }
+          // Parsing reply block header into variables
+          uint32_t body_length = ntohl(*(uint32_t *)&reply_header_buffer[0]);
+          // uint32_t status = ntohl(*(uint32_t*)&reply_header_buffer[4]);
+          current_block = ntohl(*(uint32_t *)&reply_header_buffer[8]);
+          total_blocks = ntohl(*(uint32_t *)&reply_header_buffer[12]);
+          char block_hash[32];
+          memcpy(block_hash, &reply_header_buffer[16], 32);
+          char total_hash[32];
+          memcpy(total_hash, &reply_header_buffer[48], 32);
+
+          // data_recieved += bytes_read;
+
+          // Read message body for current block
+          char message_body_buffer[body_length];
+          int total_body_read = 0;
+          while (total_body_read < body_length) {
+
+            bytes_read =
+                compsys_helper_readnb(&state, message_body_buffer, body_length);
+            total_body_read += bytes_read;
+          }
+
+          // Check the hash of this part of the message
+          hashdata_t message_hash;
+          get_data_sha(message_body_buffer, message_hash, body_length,
+                       SHA256_HASH_SIZE);
+          if (memcmp(message_hash, block_hash, SHA256_HASH_SIZE) != 0) {
+            printf("Hashes of message body of block %d / %d did not match\n",
+                   current_block, total_blocks);
+            printf("Data might be corrupted, trying with a new request.\n");
+            fclose(file);
+            close(clientfd);
+            return 0;
+          }
+
+          if (bytes_read <= 0) {
+            // maybe should have consequenses
+            printf("Recieving body segment of multi block file "
+                   "failed\n");
+            break;
+          }
+
+          blocks_recieved++;
+          //  To keep track of the final file size
+          file_data_recieved += bytes_read;
+
+          // Copy to message buffer to file buffer
+          memcpy(&file_buffer[(current_block)*max_body_length],
+                 message_body_buffer, body_length);
+          printf("Read and copied block %d\n", current_block);
+        }
+
+        // Check total message hash with total hash
+        hashdata_t total_message_hash;
+        get_data_sha(file_buffer, total_message_hash, file_data_recieved,
+                     SHA256_HASH_SIZE);
+        if (memcmp(total_message_hash, reply_block_total_hash,
+                   SHA256_HASH_SIZE) != 0) {
+          printf("The hash of the total message and the provided total hash "
+                 "didn't match\n");
+          printf("Data might be corrupted, trying with a new request.\n");
+          fclose(file);
+          close(clientfd);
+          return 0;
+        } else {
+          // Write file buffer to file if hashes match
+          fwrite(file_buffer, 1, file_data_recieved, file);
+        }
+        fclose(file);
+        close(clientfd);
+      }
     }
   }
+
   return 1;
 }
 
@@ -505,57 +521,55 @@ int send_message(NetworkAddress_t peer_address, int command,
 // Creates a new connection and sends a message.
 // Creates header, and assembles header and body to message
     int status = 1;
-  char *peer_ip = peer_address.ip;
-  char peer_port[16];
-  sprintf(peer_port, "%d", peer_address.port);
+    char *peer_ip = peer_address.ip;
+    char peer_port[16];
+    sprintf(peer_port, "%d", peer_address.port);
 
-  // Create client socket and connect
-  int clientfd = compsys_helper_open_clientfd(peer_ip, peer_port);
-  if (clientfd < 0) {
-      printf("Connection error, try again\n");
-      status = -1;
-      return status;
-  }
+    // Create client socket and connect
+    int clientfd = compsys_helper_open_clientfd(peer_ip, peer_port);
+    if (clientfd < 0) {
+        printf("Connection error, try again\n");
+        status = -1;
+        return status;
+    }
 
-  // Create and populate request header
-  RequestHeader_t req_head;
-  req_head.port = htonl(my_address->port);
-  req_head.command = htonl(command);
-  memcpy(req_head.ip, my_address->ip, IP_LEN);
-  req_head.length = htonl(request_len);
-  memcpy(req_head.signature, my_address->signature, SHA256_HASH_SIZE);
+    // Create and populate request header
+    RequestHeader_t req_head;
+    req_head.port = htonl(my_address->port);
+    req_head.command = htonl(command);
+    memcpy(req_head.ip, my_address->ip, IP_LEN);
+    req_head.length = htonl(request_len);
+    memcpy(req_head.signature, my_address->signature, SHA256_HASH_SIZE);
 
-  // Assemble request header and body
-  char send_buffer[sizeof(RequestHeader_t) + request_len];
+    // Assemble request header and body
+    char send_buffer[sizeof(RequestHeader_t) + request_len];
 
-  // Putting request header and message body in buffer to be send
-  memcpy(&send_buffer[0], &req_head, sizeof(RequestHeader_t));
-  memcpy(&send_buffer[sizeof(RequestHeader_t)], request_body, request_len);
+    // Putting request header and message body in buffer to be send
+    memcpy(&send_buffer[0], &req_head, sizeof(RequestHeader_t));
+    memcpy(&send_buffer[sizeof(RequestHeader_t)], request_body, request_len);
 
-  size_t total_message_length = request_len + sizeof(RequestHeader_t);
+    size_t total_message_length = request_len + sizeof(RequestHeader_t);
 
-  // Send request
-  int bytes_send = 0;
-  while (bytes_send < total_message_length) {
-      int n = compsys_helper_writen(clientfd, send_buffer, total_message_length);
-      if (n < 0) {
-      // TODO - proper error handling
-          printf("Error in sending inform or file request\n");
-          return -1;
-      }
-      bytes_send += n;
-  }
+    // Send request
+    int bytes_send = 0;
+    while (bytes_send < total_message_length) {
+        int n = compsys_helper_writen(clientfd, send_buffer, total_message_length);
+        if (n < 0) {
+            printf("Error in sending inform or file request\n");
+            return -1;
+        }
+        bytes_send += n;
+    }
 
-  // Handle response if relevant.
-  // Command 3 is inform and doesn't expect response
-  if (command != 3) {
-      printf("passing on to handle_response\n");
-      status = handle_response(clientfd, command, request_body, request_len);
-  }
-  // close connection after response has been handled
-  // TODO - manage connection, so we can keep trying if we get a status error 5
-  close(clientfd);
-  return status;
+    // Handle response if relevant.
+    // Command 3 is inform and doesn't expect response
+    if (command != 3) {
+        printf("passing on to handle_response\n");
+        status = handle_response(clientfd, command, request_body, request_len);
+    }
+    // close connection after response has been handled
+    close(clientfd);
+    return status;
 }
 
 
@@ -563,10 +577,6 @@ int send_message(NetworkAddress_t peer_address, int command,
 void send_error_message(char* error_message, int error_code, int connfd) {
     // Sends out an error message depending on the error code,
     // and prints appropriate message.
-    // TODO - Maybe print to stderr
-    // TODO - Maybe this can be simplified by generalizing
-    // send_response and just assemble here and then sending from
-    // there. But there is something to keeping them separate.
     // TODO - message_buffer to be allocated in the size needed,
     // depending on message.
 
@@ -681,33 +691,34 @@ void* client_thread()
     }
 
 
-  while (1) {
+    while (1) {
 
-    char filename_buffer[255];
-    int chars_read = 0;
-    fprintf(stdout, "Enter file name to get or type quit to exit: ");
-    scanf("%s%n", filename_buffer, &chars_read);
-    if (strcmp(filename_buffer, "quit") == 0) {
-        break;
-    }
-    if (strcmp(filename_buffer, "print") == 0) {
-        for (int i = 0; i<peer_count; i++) {
-        print_network_address(network[i]);
+        char filename_buffer[255];
+        int chars_read = 0;
+        fprintf(stdout, "Enter file name to get or type print to print all connected peers: ");
+        scanf("%s%n", filename_buffer, &chars_read);
+
+        if (strcmp(filename_buffer, "print") == 0) {
+            for (int i = 0; i<peer_count; i++) {
+            print_network_address(network[i]);
+            }
         }
-    }
-    NetworkAddress_t* random_peer = return_random_peer();
-    char filename[chars_read];
-    memcpy(filename, filename_buffer, chars_read);
-    printf("Requesting file %s from %s:%d\n", filename, random_peer->ip, random_peer->port);
-    // Send file request message
-    int status = send_message(*random_peer, 2, filename, chars_read-1);
-    int identical_requests = 0;
-    while ((status == 0) && (identical_requests < 5)) {
-        printf("File unavailable, trying again at another peer.\n");
-        random_peer = return_random_peer();
-        status = send_message(*random_peer, 2, filename, chars_read-1);
-        identical_requests++;
-    }
+
+        NetworkAddress_t* random_peer = return_random_peer();
+        char filename[chars_read];
+        memcpy(filename, filename_buffer, chars_read);
+        printf("Requesting file %s from %s:%d\n", filename, random_peer->ip, random_peer->port);
+
+        // Send file request message
+        int status = send_message(*random_peer, 2, filename, chars_read-1);
+        int identical_requests = 0;
+        while ((status == 0) && (identical_requests < 5)) {
+            // If file unavailable, try again 5 times
+            printf("File unavailable, trying again at another peer.\n");
+            random_peer = return_random_peer();
+            status = send_message(*random_peer, 2, filename, chars_read-1);
+            identical_requests++;
+        }
   }    
   
   // You should never see this printed in your finished implementation
@@ -725,9 +736,9 @@ void send_response(uint32_t connfd, uint32_t status, char* response_body, int re
     // and otherwise splits it up in multiple blocks
 
     int max_body_length = MAX_MSG_LEN - (sizeof(ReplyHeader_t));
-    int number_of_blocks = 0;
-    int size_of_last_block = 0;
-    char* block_buffer;
+    int number_of_blocks = (response_length/max_body_length) + 1;
+    int size_of_last_block = response_length%max_body_length;
+    char block_buffer[number_of_blocks * MAX_MSG_LEN];
 
     ReplyHeader_t* reply_header = malloc(sizeof(ReplyHeader_t));
     hashdata_t total_hash;
@@ -760,18 +771,18 @@ void send_response(uint32_t connfd, uint32_t status, char* response_body, int re
 
         // TODO - implement while loop to make sure all is written
         // as compsys_helper might be non blocking
-        int bytes_send = 0;
-        //while (bytes_send < total_response_length) {
-            int n =
-                compsys_helper_writen(connfd, outputbuffer, total_response_length);
+        size_t bytes_send = 0;
+        size_t n = 0;
+        while (bytes_send < total_response_length) {
+            n = compsys_helper_writen(connfd, outputbuffer, total_response_length);
             printf("%d bytes written and send, total response length is %zu\n", n,
                    total_response_length);
             if (n < 0) {
-                printf("Error in sending response\n");
-
+                printf("Error in sending response, aborted\n");
+                send_error_message("", 7, connfd);
             }
             bytes_send += n;
-        //}
+        }
 
         // Free output buffer when data is send
         free(outputbuffer);
@@ -779,18 +790,6 @@ void send_response(uint32_t connfd, uint32_t status, char* response_body, int re
     } else {
 
         // If message size is bigger than what fits in one block
-        // Calculate number of blocks and last block size
-        number_of_blocks = (response_length/max_body_length) + 1;
-        size_of_last_block = response_length%max_body_length;
-
-        // Allocate memory for all blocks in a buffer.
-        // TODO - check for errors in allocation - this can
-        // probably be done on stack. maybe return...
-        block_buffer = malloc(number_of_blocks * MAX_MSG_LEN);
-        if (block_buffer == NULL) {
-            printf("Error in memory allocation while sending multisegment file.\n");
-            send_error_message("", 7, connfd);
-        }
 
         // Populate reply_header for first message.
         reply_header->block_count = htonl(number_of_blocks);
@@ -811,10 +810,7 @@ void send_response(uint32_t connfd, uint32_t status, char* response_body, int re
             get_data_sha(block_data, block_hash, max_body_length, SHA256_HASH_SIZE);
             memcpy(reply_header->block_hash, block_hash, SHA256_HASH_SIZE);
 
-            // TODO - copy member fields separately and not entire struct
-            // Copy this block (reply_header + block_data) to the block_buffer. It should be ok,
-            // since data is copied, and when these pointers go out of scope
-            // data is copied, not just referenced.
+            // Copy header to output buffer
             memcpy(&block_buffer[i*MAX_MSG_LEN], &reply_header->length, 4);
             memcpy(&block_buffer[i*MAX_MSG_LEN + 4], &reply_header->status, 4);
             memcpy(&block_buffer[i*MAX_MSG_LEN + 8], &reply_header->this_block, 4);
@@ -840,15 +836,20 @@ void send_response(uint32_t connfd, uint32_t status, char* response_body, int re
         reply_header->this_block = htonl(number_of_blocks-1);
 
         // Copy into block buffer
-        // TODO - copy member fields and not entire struct
-        memcpy(&block_buffer[(number_of_blocks-1)*MAX_MSG_LEN], reply_header, sizeof(ReplyHeader_t));
+        //memcpy(&block_buffer[(number_of_blocks-1)*MAX_MSG_LEN], reply_header, sizeof(ReplyHeader_t));
+
+        memcpy(&block_buffer[(number_of_blocks-1)*MAX_MSG_LEN], &reply_header->length, 4);
+        memcpy(&block_buffer[(number_of_blocks-1)*MAX_MSG_LEN + 4], &reply_header->status, 4);
+        memcpy(&block_buffer[(number_of_blocks-1)*MAX_MSG_LEN + 8], &reply_header->this_block, 4);
+        memcpy(&block_buffer[(number_of_blocks-1)*MAX_MSG_LEN + 12], &reply_header->block_count, 4);
+        memcpy(&block_buffer[(number_of_blocks-1)*MAX_MSG_LEN + 16], &reply_header->block_hash, 32);
+        memcpy(&block_buffer[(number_of_blocks-1)*MAX_MSG_LEN + 48], &reply_header->total_hash, 32);
+
         memcpy(&block_buffer[(number_of_blocks-1)*MAX_MSG_LEN + sizeof(ReplyHeader_t)], block_data, size_of_last_block);
 
 
         // Random order for sending blocks
         // Seed random generator
-
-        // TODO - abstract away into function
         srand(time(NULL));
 
         int random_order[number_of_blocks];
@@ -857,6 +858,7 @@ void send_response(uint32_t connfd, uint32_t status, char* response_body, int re
         }
         shuffle(random_order, number_of_blocks);
 
+
         // Send blocks to peer in random order
         for (int block = 0; block < number_of_blocks; block++) {
             int random_block = random_order[block];
@@ -864,8 +866,6 @@ void send_response(uint32_t connfd, uint32_t status, char* response_body, int re
             // Check that it is not the last block, as the length is different
             if (random_block < (number_of_blocks-1)) {
                 // If not last block, send the MAX_MSG_LEN
-                // TODO - could be much less verbose
-
                 // Copy block from block buffer to send buffer, random_block is index
                 memcpy(send_buffer, &block_buffer[random_block * MAX_MSG_LEN],
                        MAX_MSG_LEN);
@@ -922,13 +922,9 @@ void handle_inform_message(RequestHeader_t* inform_header, char* inform_body) {
           } else {
             network = new_network;
           }
-          printf("unlocked and ready to update network\n");
 
-          printf("updating\n");
           network[peer_count] = new_peer;
-          printf("done\n");
           peer_count++;
-          printf("incrementing\n");
           printf("Updating network on inform.\n Number of peers %d\n",
                  peer_count);
         } else {
@@ -942,10 +938,8 @@ void handle_inform_message(RequestHeader_t* inform_header, char* inform_body) {
         pthread_mutex_unlock(&lock);
     }
 }
-/*
- * Function to act as basis for running the server thread. This thread will be
- * run concurrently with the client thread, but is infinite in nature.
- */
+
+
 void handle_register_message(RequestHeader_t* register_header, int connfd) {
 
     if (is_valid_ip(register_header->ip) && is_valid_port(register_header->port)) {
@@ -967,12 +961,8 @@ void handle_register_message(RequestHeader_t* register_header, int connfd) {
         memcpy(new_peer->salt, random_salt, SALT_LEN);
 
         // Add to network and increment peer count and reallocate memory for network
-        printf("Just before handler lock\n");
         pthread_mutex_lock(&lock);
-        printf("Just after handler lock\n");
-        /* while (!is_registered || not_alone) { */
-        /*     pthread_cond_wait(&cond, &lock); */
-        /* } */
+
         NetworkAddress_t** new_network = realloc(network, sizeof(NetworkAddress_t*)*(peer_count + 1));
         if (new_network == NULL) {
             printf("Memory allocation problem while registrering.\n");
@@ -981,8 +971,6 @@ void handle_register_message(RequestHeader_t* register_header, int connfd) {
         } else {
             network = new_network;
         }
-
-        //memcpy(new_network, network, sizeof(NetworkAddress_t*)*peer_count);
 
         if (!is_in_network(network, new_peer, peer_count)) {
             network[peer_count] = new_peer;
@@ -1046,11 +1034,9 @@ void handle_file_request(RequestHeader_t* file_request_header, int connfd, char*
     int body_length = file_request_header->length;
     char filename[body_length+1];
     FILE *file;
-    char* buffer;
+    //char* buffer;
     uint32_t file_size;
     size_t bytes_read;
-    //ReplyHeader_t* reply_header;
-    //hashdata_t block_hash;
 
     // Get name of file from request
     memcpy(filename, file_request_body, body_length);
@@ -1076,35 +1062,16 @@ void handle_file_request(RequestHeader_t* file_request_header, int connfd, char*
     file_size = ftell(file);
     rewind(file);
 
-    // Allocate buffer for file content
-    buffer = (char*) malloc(file_size + 1);
-    // Check for error in allocation
-    // TODO - error handling, if buffer isn't allocated.
-    // Right now it just continues
-    if (buffer == NULL) {
-        perror("Error in allocation of buffer for file content\n");
-        send_error_message("Unknown error\n", 7, connfd);
-        fclose(file);
-        return;
-    }
+    // Buffer for file content
+    char buffer[file_size];
 
     // Read file into buffer
     bytes_read = fread(buffer, 1, file_size, file);
-    // TODO - det her er jo kun hvis det er en string.
-    // Og det null-byte sendes jo alligevel ikke.
-    buffer[bytes_read] = '\0';
-
-
-    memcpy(filename, file_request_body, body_length);
 
     fclose(file);
 
     printf("Sending file %s as response to request. bytes_read: %zu and file size is %d\n", filename, bytes_read, file_size);
     send_response(connfd, 1, buffer, bytes_read);
-
-    free(buffer);
-
-
 
 }
 
@@ -1124,21 +1091,23 @@ void* handle_server_request(void* arg) {
     compsys_helper_state_t state;
     char request_header_buffer[REQUEST_HEADER_LEN];
 
-    // read request header and
-    // TODO implement error handling
+    // read request header
     compsys_helper_readinitb(&state, request_connfd);
     int bytes_read = 0;
     while (bytes_read < REQUEST_HEADER_LEN) {
         int n = compsys_helper_readnb(&state, request_header_buffer, REQUEST_HEADER_LEN);
         if (n < 0) {
-            printf("Error reading incoming server request header\n");
+            printf("Error reading incoming server request header, aborting.\n");
+            pthread_mutex_lock(&lock);
+            active_threads--;
+            pthread_mutex_unlock(&lock);
+            return NULL;
         }
         bytes_read += n;
     }
 
     // Parse request header data and populate
     // request header struct
-    // TODO - simplify
     char request_ip[16];
     memcpy(request_ip, &request_header_buffer[0], 16);
     uint32_t request_port = ntohl(*(uint32_t*)&request_header_buffer[16]);
@@ -1185,18 +1154,22 @@ void* handle_server_request(void* arg) {
           // Generate network saved signature of my signature
           // to be send out to the peers.
           printf("Assuming i'm the first peer\n");
+          // Make room for new peers in network[]
           NetworkAddress_t** new_network = realloc(network, sizeof(NetworkAddress_t*) * (peer_count + 1));
+
           if (new_network == NULL) {
-              printf("Memory allocation problem.\n");
-              pthread_mutex_unlock(&lock);
-              return NULL;
+            printf("Memory allocation problem.\n");
+            active_threads--;
+            pthread_mutex_unlock(&lock);
+            return NULL;
+
           } else {
               network = new_network;
           }
 
-          char random_salt[SALT_LEN + 1];
+          char random_salt[SALT_LEN];
           generate_random_salt(random_salt);
-          random_salt[SALT_LEN] = '\0';
+
           hashdata_t network_saved_signature;
           get_signature(my_address->signature, SHA256_HASH_SIZE, random_salt,
                         &network_saved_signature);
@@ -1212,25 +1185,20 @@ void* handle_server_request(void* arg) {
           not_alone = 1;
 
         pthread_mutex_unlock(&lock);
-        printf("First peer done\n");
         }
+        // is_in_network needs to be locked
+        pthread_mutex_lock(&lock);
+        int requesting_peer_is_in_network = is_in_network(network, &requesting_peer, peer_count);
+        pthread_mutex_unlock(&lock);
 
-        if (is_in_network(network, &requesting_peer, peer_count)) {
+        if (requesting_peer_is_in_network) {
             // If registering peer already registered send error response and stop.
             send_error_message("Peer already registered in network\0", 2, request_connfd);
             printf("Peer trying to register was already registered in network.\n");
 
-            /* pthread_mutex_lock(&lock); */
-            /* active_threads--; */
-            /* pthread_mutex_unlock(&lock); */
-            /* return NULL; */
         } else {
 
           printf("Incoming registration request from IP: %s Port: %d\n", request_ip, request_port);
-          if (request_body_length != 0) {
-            printf("body contains message - which it shouldn't\n");
-          }
-          printf("passing on to handler\n");
           handle_register_message(&request_header, request_connfd);
         }
       // Exit after handling the register message.
@@ -1241,21 +1209,21 @@ void* handle_server_request(void* arg) {
       // File request
       // Calculate hash of incoming signature
       hashdata_t incoming_signature_hash;
-      // TODO - free requesting_peer_info
+
       NetworkAddress_t *requesting_peer_info = malloc(sizeof(NetworkAddress_t));
+
+      pthread_mutex_lock(&lock);
       find_in_network(&requesting_peer, requesting_peer_info);
+      int requesting_peer_is_in_network = is_in_network(network, &requesting_peer, peer_count);
+      pthread_mutex_unlock(&lock);
 
       get_signature(request_signature, SHA256_HASH_SIZE,
                     requesting_peer_info->salt, &incoming_signature_hash);
 
-      if (!is_in_network(network, &requesting_peer, peer_count)) {
+      if (!requesting_peer_is_in_network) {
         // If not in network, send error message and stop.
         send_error_message("Not registered in network.\0", 3, request_connfd);
         printf("Peer requesting was not registered in network.\n");
-        /* pthread_mutex_lock(&lock); */
-        /* active_threads--; */
-        /* pthread_mutex_unlock(&lock); */
-        /* return NULL; */
 
       // Check if hashes match
       } else if (memcmp(incoming_signature_hash, requesting_peer_info->signature,
@@ -1264,10 +1232,6 @@ void* handle_server_request(void* arg) {
         printf("Password mismatch\n");
         send_error_message("Password mismatch\0", 4, request_connfd);
 
-        /* pthread_mutex_lock(&lock); */
-        /* active_threads--; */
-        /* pthread_mutex_unlock(&lock); */
-        /* return NULL; */
       } else {
         // If no error handle file request by passing on to handle_file_request
         printf("Incoming file request from IP: %s Port: %d\n", request_ip,
@@ -1283,9 +1247,13 @@ void* handle_server_request(void* arg) {
         // by passing it on to function. After that exit.
         // Calculate hash of incoming signature
         hashdata_t incoming_signature_hash;
-        // TODO - free requesting_peer_info
+
         NetworkAddress_t *requesting_peer_info = malloc(sizeof(NetworkAddress_t));
+
+        pthread_mutex_lock(&lock);
         find_in_network(&requesting_peer, requesting_peer_info);
+        int requesting_peer_is_in_network = is_in_network(network, &requesting_peer, peer_count);
+        pthread_mutex_unlock(&lock);
 
         get_signature(request_signature, SHA256_HASH_SIZE,
                     requesting_peer_info->salt, &incoming_signature_hash);
@@ -1294,14 +1262,14 @@ void* handle_server_request(void* arg) {
             printf("Inform request body is the wrong length. It is: %d\n", request_body_length);
             send_error_message("", 7, request_connfd);
 
-        } else if (!is_in_network(network, &requesting_peer, peer_count)) {
+        } else if (!requesting_peer_is_in_network) {
           // if not registered, send error - even though it's just inform
           send_error_message("Informing peer not registered in network.\0", 3, request_connfd);
-          /* printf("Peer requesting was not registered in network.\n"); */
 
         } else if (memcmp(incoming_signature_hash, requesting_peer_info->signature, SHA256_HASH_SIZE) != 0) {
             // Password mismatch
             send_error_message("Password mismatch\0", 4, request_connfd);
+
         } else {
           handle_inform_message(&request_header, request_body);
         }
@@ -1320,7 +1288,10 @@ void* handle_server_request(void* arg) {
     return NULL;
 }
 
-
+/*
+ * Function to act as basis for running the server thread. This thread will be
+ * run concurrently with the client thread, but is infinite in nature.
+ */
 void* server_thread() {
     // Main server thread. Listening for connections
     // and spawns threads to handle requests.
