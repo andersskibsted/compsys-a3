@@ -12,7 +12,22 @@ compsys_helpers.o: compsys_helpers.c compsys_helpers.h
 common.o: common.c common.h
 	$(GCC) -c $< -o $@
 
-peer: peer.c peer.h common.o compsys_helpers.o sha256.o
+network.o: network.c network.h
+	$(GCC) -c $< -o $@
+
+security.o: security.c security.h
+	$(GCC) -c $< -o $@
+
+utils.o: utils.c utils.h
+	$(GCC) -c $< -o $@
+
+messages.o: messages.c messages.h utils.h network.h
+	$(GCC) -c $< -o $@
+
+request_handlers.o: request_handlers.c request_handlers.h messages.h network.h security.h peer.h
+	$(GCC) -c $< -o $@
+
+peer: peer.c peer.h common.o compsys_helpers.o sha256.o network.o security.o utils.o request_handlers.o messages.o
 	$(GCC) $< *.o -o $@ $(LD_FLAGS)
 
 hasher: hasher.c peer.h common.o compsys_helpers.o sha256.o
